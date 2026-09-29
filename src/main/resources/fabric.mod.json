@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "${id}",
+  "version": "${version}",
+
+  "name": "${name}",
+  "description": "${description}",
+  "authors": [
+    "Pándor"
+  ],
+
+  "license": "MIT",
+  "icon": "assets/${id}/icon.png",
+
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "${group}.${id}.Regionium"
+    ],
+    "fabric-datagen": [
+      "${group}.${id}.datagen.fabric.ExampleDataGenerator"
+    ],
+    "fabric-gametest": [
+      "${group}.${id}.gametest.ExampleGameTests"
+    ]
+  },
+  "depends": {
+    "fabricloader": "*",
+    "fabric-api": ">=${fabricVersion}",
+    "minecraft": ">=${minecraftVersionVirtual}"
+  }
+}
