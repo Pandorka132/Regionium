@@ -26,9 +26,7 @@ stonecutter {
             for (it in loaders) version("$version-$it", version)
         }
 
-        mc("26.1", "fabric", "forge", "neoforge")
-        mc("26.2", "fabric", "forge", "neoforge")
-        mc("26.3", "fabric", "forge", "neoforge")
+        mc("26.3", "fabric")
 
         vcsVersion = "26.3-fabric"
     }
