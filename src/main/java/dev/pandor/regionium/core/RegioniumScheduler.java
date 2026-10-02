@@ -104,6 +104,7 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
 
         try {
+            List<Future<?>> futures = new ArrayList<>(regions.size());
             synchronized (tickLock) {
                 if (closed) {
                     throw new IllegalStateException("Regionium scheduler is closed");
@@ -112,11 +113,13 @@ public final class RegioniumScheduler implements AutoCloseable {
                 running = true;
                 applyPendingTransfers();
                 tick++;
-            }
 
-            List<Future<?>> futures = new ArrayList<>(regions.size());
-            for (RegioniumRegion region : regions) {
-                futures.add(workers.submit(region::tick));
+                // Keep the state lock until every region task has been
+                // submitted. close() can then safely shut down the executor
+                // while this tick is waiting for already-submitted work.
+                for (RegioniumRegion region : regions) {
+                    futures.add(workers.submit(region::tick));
+                }
             }
 
             Throwable failure = null;
