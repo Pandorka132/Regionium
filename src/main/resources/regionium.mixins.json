@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "dev.pandor.regionium.mixins",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": [
+    "TestMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
