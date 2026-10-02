@@ -174,8 +174,9 @@ public final class RegioniumScheduler implements AutoCloseable {
                 RegioniumContext.enter(target);
                 ServerChunkCache chunkCache = null;
                 Thread previousChunkThread = null;
+                ServerLevel executionLevel = null;
+                Thread previousLevelThread = null;
                 try {
-                    ServerLevel executionLevel = null;
                     if (object instanceof ServerLevel level) {
                         executionLevel = level;
                     } else if (object instanceof ServerPlayer player && player.level() instanceof ServerLevel level) {
@@ -183,6 +184,10 @@ public final class RegioniumScheduler implements AutoCloseable {
                     }
 
                     if (executionLevel != null) {
+                        var levelThreadAccess = (dev.pandor.regionium.LevelThreadAccess) executionLevel;
+                        previousLevelThread = levelThreadAccess.regionium$getThread();
+                        levelThreadAccess.regionium$setThread(Thread.currentThread());
+
                         chunkCache = executionLevel.getChunkSource();
                         var threadAccess = (dev.pandor.regionium.ServerChunkCacheThreadAccess) chunkCache;
                         previousChunkThread = threadAccess.regionium$getMainThread();
@@ -193,6 +198,10 @@ public final class RegioniumScheduler implements AutoCloseable {
                     if (chunkCache != null) {
                         var threadAccess = (dev.pandor.regionium.ServerChunkCacheThreadAccess) chunkCache;
                         threadAccess.regionium$setMainThread(previousChunkThread);
+                    }
+                    if (executionLevel != null) {
+                        var levelThreadAccess = (dev.pandor.regionium.LevelThreadAccess) executionLevel;
+                        levelThreadAccess.regionium$setThread(previousLevelThread);
                     }
                     RegioniumContext.exit();
                 }
