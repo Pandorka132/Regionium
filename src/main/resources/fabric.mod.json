@@ -24,6 +24,9 @@
       "${group}.${id}.gametest.ExampleGameTests"
     ]
   },
+  "mixins": [
+    "regionium.mixins.json"
+  ],
   "depends": {
     "fabricloader": "*",
     "fabric-api": ">=${fabricVersion}",
