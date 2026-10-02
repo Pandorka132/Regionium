@@ -3,7 +3,12 @@
   "package": "dev.pandor.regionium.mixins",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
-    "TestMixin"
+    "PlayerTickDebugMixin",
+    "MinecraftServerTaskAccess",
+    "ServerLevelTickRegioniumMixin",
+    "ServerChunkCacheThreadMixin",
+    "ServerGamePacketListenerRegioniumMixin",
+    "PacketProcessorRegioniumMixin"
   ],
   "injectors": {
     "defaultRequire": 1

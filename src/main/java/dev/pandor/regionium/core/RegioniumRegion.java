@@ -3,6 +3,8 @@ package dev.pandor.regionium.core;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import dev.pandor.regionium.Regionium;
+
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -21,6 +23,7 @@ public final class RegioniumRegion {
     private final AtomicReference<Queue<RegioniumTask>> mailbox =
         new AtomicReference<>(new ConcurrentLinkedQueue<>());
     private final AtomicBoolean ticking = new AtomicBoolean();
+    private final AtomicBoolean workerLogged = new AtomicBoolean();
 
     RegioniumRegion(int id) {
         if (id < 0) {
@@ -48,13 +51,18 @@ public final class RegioniumRegion {
      */
     void tick() {
         if (!ticking.compareAndSet(false, true)) {
-            throw new IllegalStateException("Region " + id + " is already ticking");
+            // Never execute two ticks for the same region concurrently.
+            // Work submitted to the mailbox remains queued for a later tick.
+            return;
         }
 
         Queue<RegioniumTask> currentMailbox = mailbox.getAndSet(new ConcurrentLinkedQueue<>());
 
         RegioniumContext.enter(this);
         try {
+            if (workerLogged.compareAndSet(false, true)) {
+                Regionium.LOGGER.info("Region {} is executing on {}", id, Thread.currentThread().getName());
+            }
             RegioniumTask task;
             while ((task = currentMailbox.poll()) != null) {
                 task.run();
