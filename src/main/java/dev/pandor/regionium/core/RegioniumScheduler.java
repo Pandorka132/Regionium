@@ -1,6 +1,9 @@
 package dev.pandor.regionium.core;
 
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerChunkCache;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -18,15 +21,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Coordinates Regionium worker threads and tick boundaries.
  *
- * <p>This is deliberately independent from Minecraft's World implementation.
+ * <p>This is deliberately independent of Minecraft's World implementation.
  * The scheduler provides the concurrency primitive first; Minecraft systems
  * are integrated into it in separate, narrowly scoped Mixins.</p>
  */
 public final class RegioniumScheduler implements AutoCloseable {
-    public static final int DEFAULT_REGION_COUNT = Math.max(
-        1,
-        Math.min(Runtime.getRuntime().availableProcessors(), 16)
-    );
+    static int processors = Runtime.getRuntime().availableProcessors();
+    public static final int DEFAULT_REGION_COUNT = Math.clamp(processors, 1, 16);
 
     private final List<RegioniumRegion> regions;
     private final ExecutorService workers;
@@ -122,34 +123,16 @@ public final class RegioniumScheduler implements AutoCloseable {
                 }
             }
 
-            Throwable failure = null;
-            boolean interrupted = false;
-
-            for (Future<?> future : futures) {
-                try {
-                    future.get();
-                } catch (InterruptedException interruption) {
-                    interrupted = true;
-                    if (failure == null) {
-                        failure = interruption;
-                    }
-                } catch (java.util.concurrent.ExecutionException executionFailure) {
-                    if (failure == null) {
-                        failure = executionFailure.getCause();
-                    }
-                }
-            }
-
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
-
-            if (failure != null) {
-                if (failure instanceof Error error) {
-                    throw error;
-                }
-                throw new IllegalStateException("Regionium region tick failed", failure);
-            }
+            // Region ticks are intentionally asynchronous.
+            //
+            // The Minecraft server thread must never wait for a region worker:
+            // vanilla code executed by a region may legitimately schedule work
+            // back onto the server thread. Waiting here would create a deadlock.
+            //
+            // Regionium will add an explicit tick barrier once the vanilla
+            // server/world tick is fully owned by the region scheduler.
+            // For now, submitting the work is enough to establish execution
+            // on the Regionium workers without blocking the server thread.
         } finally {
             tickInProgress.set(false);
         }
@@ -158,6 +141,132 @@ public final class RegioniumScheduler implements AutoCloseable {
     public void execute(int regionId, Runnable action) {
         Objects.requireNonNull(action, "action");
         region(regionId).execute(action);
+    }
+
+    /**
+     * Runs a world-tick unit on its owning region and waits for completion.
+     * This is used at a vanilla tick boundary so the server thread cannot
+     * concurrently touch the same world state.
+     */
+    public void executeEntityAndWait(MinecraftServer server, Object object, Runnable action) {
+        Objects.requireNonNull(object, "object");
+        Objects.requireNonNull(action, "action");
+
+        RegioniumRegion owner = ownerOf(object);
+        if (owner == null) {
+            synchronized (tickLock) {
+                if (closed) {
+                    throw new IllegalStateException("Regionium scheduler is closed");
+                }
+                owner = ownerOf(object);
+                if (owner == null) {
+                    int regionId = Math.floorMod(System.identityHashCode(object), regions.size());
+                    owner = regions.get(regionId);
+                    ownership.assign(object, owner);
+                }
+            }
+        }
+
+        final RegioniumRegion target = owner;
+
+        try {
+            Future<?> future = workers.submit(() -> {
+                RegioniumContext.enter(target);
+                ServerChunkCache chunkCache = null;
+                Thread previousChunkThread = null;
+                try {
+                    ServerLevel executionLevel = null;
+                    if (object instanceof ServerLevel level) {
+                        executionLevel = level;
+                    } else if (object instanceof ServerPlayer player && player.level() instanceof ServerLevel level) {
+                        executionLevel = level;
+                    }
+
+                    if (executionLevel != null) {
+                        chunkCache = executionLevel.getChunkSource();
+                        var threadAccess = (dev.pandor.regionium.ServerChunkCacheThreadAccess) chunkCache;
+                        previousChunkThread = threadAccess.regionium$getMainThread();
+                        threadAccess.regionium$setMainThread(Thread.currentThread());
+                    }
+                    action.run();
+                } finally {
+                    if (chunkCache != null) {
+                        var threadAccess = (dev.pandor.regionium.ServerChunkCacheThreadAccess) chunkCache;
+                        threadAccess.regionium$setMainThread(previousChunkThread);
+                    }
+                    RegioniumContext.exit();
+                }
+            });
+
+            // The server thread must not poll ServerChunkCache while the region
+            // worker is ticking the world: that mutates DistanceManager/light
+            // scheduling structures concurrently. The worker temporarily becomes
+            // the cache's main-thread identity instead, making getChunk() use its
+            // synchronous path without a cross-thread future/join.
+            while (!future.isDone()) {
+                Thread.yield();
+            }
+            future.get();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for Regionium work", interrupted);
+        } catch (java.util.concurrent.ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof RuntimeException runtime) throw runtime;
+            if (cause instanceof Error error) throw error;
+            throw new IllegalStateException("Regionium work failed", cause);
+        }
+    }
+
+    /**
+     * Resolves an object's execution owner. Players are world-owned: packet
+     * handlers may arrive on the vanilla server thread, so a player must use
+     * the same region as the ServerLevel it currently inhabits instead of
+     * receiving an unrelated hash-based owner.
+     */
+    private RegioniumRegion ownerOf(Object object) {
+        RegioniumRegion owner = ownership.ownerOf(object);
+        if (owner != null) {
+            return owner;
+        }
+
+        if (object instanceof ServerPlayer player) {
+            ServerLevel level = (ServerLevel) player.level();
+            owner = ownership.ownerOf(level);
+            if (owner != null) {
+                ownership.assign(object, owner);
+                return owner;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Schedules a Minecraft object on its Regionium owner, assigning an
+     * initial deterministic owner when it is first seen.
+     */
+    public void executeEntity(Object object, Runnable action) {
+        Objects.requireNonNull(object, "object");
+        Objects.requireNonNull(action, "action");
+
+        RegioniumRegion owner = ownership.ownerOf(object);
+        if (owner == null) {
+            synchronized (tickLock) {
+                if (closed) {
+                    throw new IllegalStateException("Regionium scheduler is closed");
+                }
+
+                owner = ownership.ownerOf(object);
+                if (owner == null) {
+                    int regionId = Math.floorMod(System.identityHashCode(object), regions.size());
+                    owner = regions.get(regionId);
+                    ownership.assign(object, owner);
+                }
+            }
+        }
+
+        executeOwned(object, action);
     }
 
     /**
