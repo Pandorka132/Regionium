@@ -3,6 +3,7 @@ package dev.pandor.regionium.core;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Execution domain for a group of Minecraft objects.
@@ -10,13 +11,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>The region does not own a World instance. The final design intentionally
  * keeps Minecraft's world, chunks, entities and players in shared memory and
  * only moves execution ownership between regions.</p>
+ *
+ * <p>Mailbox submission is separated at the tick boundary with an atomic
+ * queue swap. Work submitted while a region is ticking therefore cannot
+ * re-enter the current tick.</p>
  */
 public final class RegioniumRegion {
     private final int id;
-    private final Queue<RegioniumTask> mailbox = new ConcurrentLinkedQueue<>();
+    private final AtomicReference<Queue<RegioniumTask>> mailbox =
+        new AtomicReference<>(new ConcurrentLinkedQueue<>());
     private final AtomicBoolean ticking = new AtomicBoolean();
 
     RegioniumRegion(int id) {
+        if (id < 0) {
+            throw new IllegalArgumentException("id must be non-negative");
+        }
         this.id = id;
     }
 
@@ -29,27 +38,25 @@ public final class RegioniumRegion {
     }
 
     public void execute(Runnable action) {
-        mailbox.add(new RegioniumTask(action));
+        mailbox.get().add(new RegioniumTask(action));
     }
 
+    /**
+     * Executes exactly the mailbox that existed at the beginning of this
+     * region tick. Tasks submitted after the queue swap belong to the next
+     * tick.
+     */
     void tick() {
         if (!ticking.compareAndSet(false, true)) {
             throw new IllegalStateException("Region " + id + " is already ticking");
         }
 
+        Queue<RegioniumTask> currentMailbox = mailbox.getAndSet(new ConcurrentLinkedQueue<>());
+
         RegioniumContext.enter(this);
         try {
-            /*
-             * Do not drain tasks into a local list here. Tasks submitted while
-             * this region is running must remain visible only at the next tick
-             * boundary, so a bounded snapshot is used.
-             */
-            int taskCount = mailbox.size();
-            for (int i = 0; i < taskCount; i++) {
-                RegioniumTask task = mailbox.poll();
-                if (task == null) {
-                    break;
-                }
+            RegioniumTask task;
+            while ((task = currentMailbox.poll()) != null) {
                 task.run();
             }
         } finally {
