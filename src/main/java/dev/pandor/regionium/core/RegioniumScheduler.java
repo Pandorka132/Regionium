@@ -4,6 +4,8 @@ import net.minecraft.server.MinecraftServer;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -29,7 +31,7 @@ public final class RegioniumScheduler implements AutoCloseable {
     private final ExecutorService workers;
     private final RegioniumOwnership ownership = new RegioniumOwnership();
     private final Object tickLock = new Object();
-    private final List<OwnershipTransfer> pendingTransfers = new ArrayList<>();
+    private final Map<Object, RegioniumRegion> pendingTransfers = new IdentityHashMap<>();
 
     private volatile boolean running;
     private volatile boolean closed;
@@ -109,40 +111,33 @@ public final class RegioniumScheduler implements AutoCloseable {
                 futures.add(workers.submit(region::tick));
             }
 
-            RuntimeException failure = null;
-            Error error = null;
+            Throwable failure = null;
+            boolean interrupted = false;
 
             for (Future<?> future : futures) {
                 try {
                     future.get();
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    failure = new IllegalStateException(
-                        "Interrupted while waiting for Regionium regions",
-                        interrupted
-                    );
-                    break;
-                } catch (java.util.concurrent.ExecutionException executionFailure) {
-                    Throwable cause = executionFailure.getCause();
-                    if (cause instanceof Error e) {
-                        error = e;
-                    } else if (cause instanceof RuntimeException e) {
-                        failure = e;
-                    } else {
-                        failure = new IllegalStateException(
-                            "Regionium region tick failed",
-                            cause
-                        );
+                } catch (InterruptedException interruption) {
+                    interrupted = true;
+                    if (failure == null) {
+                        failure = interruption;
                     }
-                    break;
+                } catch (java.util.concurrent.ExecutionException executionFailure) {
+                    if (failure == null) {
+                        failure = executionFailure.getCause();
+                    }
                 }
             }
 
-            if (failure != null) {
-                throw new IllegalStateException("Regionium region tick failed", failure);
+            if (interrupted) {
+                Thread.currentThread().interrupt();
             }
-            if (error != null) {
-                throw error;
+
+            if (failure != null) {
+                if (failure instanceof Error error) {
+                    throw error;
+                }
+                throw new IllegalStateException("Regionium region tick failed", failure);
             }
         }
     }
@@ -150,6 +145,27 @@ public final class RegioniumScheduler implements AutoCloseable {
     public void execute(int regionId, Runnable action) {
         Objects.requireNonNull(action, "action");
         region(regionId).execute(action);
+    }
+
+    /**
+     * Registers an object with its initial execution owner.
+     *
+     * <p>This is registration, not migration. Reassigning an already-owned
+     * object to another region is rejected by the ownership registry.</p>
+     */
+    public void assign(Object object, RegioniumRegion region) {
+        Objects.requireNonNull(object, "object");
+        Objects.requireNonNull(region, "region");
+
+        synchronized (tickLock) {
+            if (closed) {
+                throw new IllegalStateException("Regionium scheduler is closed");
+            }
+            if (region.id() < 0 || region.id() >= regions.size() || regions.get(region.id()) != region) {
+                throw new IllegalArgumentException("Region does not belong to this scheduler");
+            }
+            ownership.assign(object, region);
+        }
     }
 
     /**
@@ -182,7 +198,7 @@ public final class RegioniumScheduler implements AutoCloseable {
             if (closed) {
                 throw new IllegalStateException("Regionium scheduler is closed");
             }
-            pendingTransfers.add(new OwnershipTransfer(object, destination));
+            pendingTransfers.put(object, destination);
         }
     }
 
@@ -195,8 +211,8 @@ public final class RegioniumScheduler implements AutoCloseable {
             return;
         }
 
-        for (OwnershipTransfer transfer : pendingTransfers) {
-            ownership.transfer(transfer.object(), transfer.destination());
+        for (Map.Entry<Object, RegioniumRegion> transfer : pendingTransfers.entrySet()) {
+            ownership.transfer(transfer.getKey(), transfer.getValue());
         }
         pendingTransfers.clear();
     }
@@ -222,6 +238,4 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
     }
 
-    private record OwnershipTransfer(Object object, RegioniumRegion destination) {
-    }
 }
