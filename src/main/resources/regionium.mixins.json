@@ -7,6 +7,7 @@
     "MinecraftServerTaskAccess",
     "ServerLevelTickRegioniumMixin",
     "ServerChunkCacheThreadMixin",
+    "LevelThreadMixin",
     "ServerGamePacketListenerRegioniumMixin",
     "PacketProcessorRegioniumMixin"
   ],
