@@ -1,6 +1,9 @@
+
 package dev.pandor.regionium.core;
 
 import org.jetbrains.annotations.Nullable;
+
+import java.util.Objects;
 
 /**
  * Describes which Regionium execution context the current thread is in.
@@ -16,7 +19,7 @@ public final class RegioniumContext {
     }
 
     public static void enter(RegioniumRegion region) {
-        CURRENT_REGION.set(region);
+        CURRENT_REGION.set(Objects.requireNonNull(region, "region"));
     }
 
     public static void exit() {
@@ -37,5 +40,26 @@ public final class RegioniumContext {
             throw new IllegalStateException("This operation requires a Regionium region thread");
         }
         return region;
+    }
+
+    /**
+     * Verifies that the current worker is the execution owner of an object.
+     *
+     * <p>This is intended for debug guards around Minecraft operations that
+     * must never be performed by another region.</p>
+     */
+    public static void requireOwner(RegioniumOwnership ownership, Object object) {
+        Objects.requireNonNull(ownership, "ownership");
+        Objects.requireNonNull(object, "object");
+
+        RegioniumRegion current = requireRegionThread();
+        if (!ownership.isOwnedBy(object, current)) {
+            RegioniumRegion owner = ownership.ownerOf(object);
+            throw new IllegalStateException(
+                "Illegal cross-region access: current=" + current
+                    + ", owner=" + owner
+                    + ", object=" + object
+            );
+        }
     }
 }
