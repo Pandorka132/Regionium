@@ -13,6 +13,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Coordinates Regionium worker threads and tick boundaries.
@@ -36,6 +37,7 @@ public final class RegioniumScheduler implements AutoCloseable {
     private volatile boolean running;
     private volatile boolean closed;
     private long tick;
+    private final AtomicBoolean tickInProgress = new AtomicBoolean();
 
     public RegioniumScheduler() {
         this(DEFAULT_REGION_COUNT);
@@ -97,14 +99,20 @@ public final class RegioniumScheduler implements AutoCloseable {
     public void tick(MinecraftServer server) {
         Objects.requireNonNull(server, "server");
 
-        synchronized (tickLock) {
-            if (closed) {
-                throw new IllegalStateException("Regionium scheduler is closed");
-            }
+        if (!tickInProgress.compareAndSet(false, true)) {
+            throw new IllegalStateException("Regionium tick is already in progress");
+        }
 
-            running = true;
-            applyPendingTransfers();
-            tick++;
+        try {
+            synchronized (tickLock) {
+                if (closed) {
+                    throw new IllegalStateException("Regionium scheduler is closed");
+                }
+
+                running = true;
+                applyPendingTransfers();
+                tick++;
+            }
 
             List<Future<?>> futures = new ArrayList<>(regions.size());
             for (RegioniumRegion region : regions) {
@@ -139,6 +147,8 @@ public final class RegioniumScheduler implements AutoCloseable {
                 }
                 throw new IllegalStateException("Regionium region tick failed", failure);
             }
+        } finally {
+            tickInProgress.set(false);
         }
     }
 
@@ -178,12 +188,34 @@ public final class RegioniumScheduler implements AutoCloseable {
         Objects.requireNonNull(object, "object");
         Objects.requireNonNull(action, "action");
 
-        RegioniumRegion owner = ownership.ownerOf(object);
-        if (owner == null) {
+        if (ownership.ownerOf(object) == null) {
             throw new IllegalStateException("Object has no Regionium owner: " + object);
         }
 
-        owner.execute(action);
+        executeOwned(object, action);
+    }
+
+    private void executeOwned(Object object, Runnable action) {
+        RegioniumRegion owner = ownership.ownerOf(object);
+        if (owner == null) {
+            throw new IllegalStateException("Object no longer has a Regionium owner: " + object);
+        }
+
+        owner.execute(() -> {
+            RegioniumRegion current = RegioniumContext.requireRegionThread();
+            RegioniumRegion actualOwner = ownership.ownerOf(object);
+
+            if (actualOwner == null) {
+                throw new IllegalStateException("Object no longer has a Regionium owner: " + object);
+            }
+
+            if (actualOwner != current) {
+                executeOwned(object, action);
+                return;
+            }
+
+            action.run();
+        });
     }
 
     /**
@@ -197,6 +229,14 @@ public final class RegioniumScheduler implements AutoCloseable {
         synchronized (tickLock) {
             if (closed) {
                 throw new IllegalStateException("Regionium scheduler is closed");
+            }
+            if (destination.id() < 0
+                || destination.id() >= regions.size()
+                || regions.get(destination.id()) != destination) {
+                throw new IllegalArgumentException("Region does not belong to this scheduler");
+            }
+            if (ownership.ownerOf(object) == null && !pendingTransfers.containsKey(object)) {
+                throw new IllegalStateException("Cannot transfer an object without an owner: " + object);
             }
             pendingTransfers.put(object, destination);
         }
