@@ -174,6 +174,9 @@ public final class RegioniumScheduler implements AutoCloseable {
             if (closed) {
                 throw new IllegalStateException("Regionium scheduler is closed");
             }
+            if (tickInProgress.get()) {
+                throw new IllegalStateException("Cannot assign ownership during an active Regionium tick");
+            }
             if (region.id() < 0 || region.id() >= regions.size() || regions.get(region.id()) != region) {
                 throw new IllegalArgumentException("Region does not belong to this scheduler");
             }
