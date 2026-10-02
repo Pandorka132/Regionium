@@ -1,3 +1,4 @@
+
 package dev.pandor.regionium.core;
 
 import java.util.IdentityHashMap;
@@ -11,9 +12,9 @@ import java.util.Objects;
  * <p>Identity semantics are intentional: two different Minecraft objects that
  * happen to implement equal/hashCode must never share ownership.</p>
  *
- * <p>Direct ownership changes are package-private and are performed by the
- * scheduler at a tick boundary. Public callers should use the scheduler's
- * request APIs instead of mutating ownership during a tick.</p>
+ * <p>Direct ownership changes are controlled by the scheduler. Callers should
+ * normally use scheduler assignment/transfer APIs so changes happen at safe
+ * tick boundaries.</p>
  */
 public final class RegioniumOwnership {
     private final Map<Object, RegioniumRegion> owners = new IdentityHashMap<>();
@@ -29,7 +30,7 @@ public final class RegioniumOwnership {
         return owners.get(object) == region;
     }
 
-    public synchronized void assign(Object object, RegioniumRegion region) {
+    synchronized void assign(Object object, RegioniumRegion region) {
         Objects.requireNonNull(object, "object");
         Objects.requireNonNull(region, "region");
 
