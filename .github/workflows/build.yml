@@ -71,7 +71,7 @@ jobs:
 
       - name: "🧪 Run Dev Build"
         if: ${{ steps.get-next-version.outputs.new_release_published != 'true' }}
-        run: ./gradlew :26.3-fabric:runGameTestServer buildAndCollect --stacktrace
+        run: ./gradlew runGameTestServer buildAndCollect --stacktrace
 
       - name: "🏗️ Build, Test & Release"
         if: ${{ steps.get-next-version.outputs.new_release_published == 'true' }}
