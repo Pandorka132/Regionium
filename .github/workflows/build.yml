@@ -102,4 +102,4 @@ jobs:
           path: |
             build/libs/*.jar
             build/reports/**/*
-            versions/*/build/reports/**/*
+            versions/*/build/libs/*
