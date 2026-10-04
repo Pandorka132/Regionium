@@ -44,6 +44,10 @@ public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
     private final ThreadLocal<int[]> regionium$count =
         ThreadLocal.withInitial(() -> new int[1]);
 
+    @Unique
+    private final ThreadLocal<int[]> regionium$runDepth =
+        ThreadLocal.withInitial(() -> new int[1]);
+
     @Redirect(
         method = {"addAndRun", "runUpdates"},
         at = @At(
@@ -92,11 +96,23 @@ public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
         regionium$count.get()[0] = value;
     }
 
+    @Inject(method = "runUpdates", at = @At("HEAD"))
+    private void regionium$enterRunUpdates(CallbackInfo ci) {
+        regionium$runDepth.get()[0]++;
+    }
+
     @Inject(method = "runUpdates", at = @At("RETURN"))
     private void regionium$cleanupThreadLocalState(CallbackInfo ci) {
+        int[] depth = regionium$runDepth.get();
+        depth[0]--;
+        if (depth[0] > 0) {
+            return;
+        }
+
         regionium$stack.get().clear();
         regionium$addedThisLayer.get().clear();
         regionium$count.get()[0] = 0;
+        depth[0] = 0;
     }
 }
 

@@ -2,6 +2,7 @@ package dev.pandor.regionium.mixins;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.server.level.ServerLevel;
@@ -12,6 +13,9 @@ import net.minecraft.util.debug.LevelDebugSynchronizers;
 import net.minecraft.world.ticks.LevelTicks;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.function.BiConsumer;
 
@@ -93,20 +97,35 @@ public abstract class ServerLevelTickRegioniumMixin {
         }
     }
 
-    @WrapOperation(
-        method = "tick",
-        at = @At(
-            value = "INVOKE",
-            target = "Lnet/minecraft/server/level/ServerLevel;tickTime()V"
-        )
-    )
-    private void regionium$globalizeTime(
-        ServerLevel self,
-        Operation<Void> original
-    ) {
+    @Inject(method = "tickTime", at = @At("HEAD"), cancellable = true)
+    private void regionium$regionTickTime(CallbackInfo ci) {
         if (!RegioniumContext.isRegionThread()) {
-            original.call(self);
+            return;
         }
+
+        ServerLevel level = (ServerLevel) (Object) this;
+        var region = RegioniumContext.requireRegionThread();
+        var data = Regionium.scheduler().worldData(level);
+        data.setRedstoneTime(region, data.redstoneTime(region) + 1L);
+        ci.cancel();
+    }
+
+    /**
+     * LevelAccessor#createTick() uses getGameTime() when it creates scheduled
+     * block/fluid ticks. On a region worker that must be the region's
+     * redstone clock, not the shared ServerLevel clock.
+     */
+    public long getGameTime() {
+        if (RegioniumContext.isRegionThread()) {
+            var region = RegioniumContext.currentRegion();
+            if (region != null) {
+                ServerLevel level = (ServerLevel) (Object) this;
+                return Regionium.scheduler().worldData(level).redstoneTime(region);
+            }
+        }
+
+        return ((net.minecraft.world.level.storage.LevelData)
+            ((ServerLevel) (Object) this).getLevelData()).getGameTime();
     }
 
     @WrapOperation(
@@ -191,11 +210,37 @@ public abstract class ServerLevelTickRegioniumMixin {
         }
     }
 
+    /**
+     * Folia architecture: ServerLevel exposes the region-owned LevelTicks
+     * directly. Vanilla scheduling code therefore needs no special-case
+     * routing: every scheduleTick() call made by a region task naturally lands
+     * in that region's queue.
+     */
+    @Inject(method = "getBlockTicks", at = @At("HEAD"), cancellable = true)
+    private void regionium$getRegionBlockTicks(CallbackInfoReturnable<LevelTicks<net.minecraft.world.level.block.Block>> cir) {
+        if (!RegioniumContext.isRegionThread()) return;
+        var region = RegioniumContext.currentRegion();
+        var level = (ServerLevel) (Object) this;
+        if (region != null) {
+            cir.setReturnValue(Regionium.scheduler().worldData(level).blockTicks(region));
+        }
+    }
+
+    @Inject(method = "getFluidTicks", at = @At("HEAD"), cancellable = true)
+    private void regionium$getRegionFluidTicks(CallbackInfoReturnable<LevelTicks<net.minecraft.world.level.material.Fluid>> cir) {
+        if (!RegioniumContext.isRegionThread()) return;
+        var region = RegioniumContext.currentRegion();
+        var level = (ServerLevel) (Object) this;
+        if (region != null) {
+            cir.setReturnValue(Regionium.scheduler().worldData(level).fluidTicks(region));
+        }
+    }
+
     /*
      * LevelTicks is shared world state. The region tick owns the callback,
      * but the global maintenance pass must never consume the same queue.
      */
-    @WrapOperation(
+    @Redirect(
         method = "tick",
         at = @At(
             value = "INVOKE",
@@ -206,24 +251,13 @@ public abstract class ServerLevelTickRegioniumMixin {
         LevelTicks<?> ticks,
         long gameTime,
         int maxTicks,
-        BiConsumer callback,
-        Operation<Void> original
+        BiConsumer callback
     ) {
         ServerLevel level = (ServerLevel) (Object) this;
-        Regionium.scheduler().flushScheduledTickWrites(ticks);
 
         if (!RegioniumContext.isRegionThread()) {
-            // Do not consume the shared queue from the global maintenance
-            // pass. Every callback is dispatched by a region clock.
             return;
         }
-
-        Regionium.scheduler().tickScheduledTicksRegionally(
-            level,
-            ticks,
-            gameTime,
-            maxTicks,
-            callback
-        );
+        Regionium.scheduler().tickScheduledTicksRegionally(level, ticks, maxTicks, callback);
     }
 }
