@@ -91,10 +91,9 @@ public final class Regionium implements ModInitializer {
                                      * the destination worker while the world keeps ticking on
                                      * the source worker.
                                      */
-                                    var level = (net.minecraft.server.level.ServerLevel) player.level();
-                                    SCHEDULER.ownerOf(level);
-                                    SCHEDULER.ownerOf(player);
-                                    SCHEDULER.requestTransfer(level, destination);
+                                    // ServerLevel is shared state in the regionized architecture;
+                                    // only the player's execution ownership is migrated here.
+                                    // The destination region must already be a valid region of this scheduler.
                                     SCHEDULER.requestTransfer(player, destination);
                                     SCHEDULER.applyPendingTransfers();
 

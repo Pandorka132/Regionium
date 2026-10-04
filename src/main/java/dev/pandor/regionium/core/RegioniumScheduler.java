@@ -13,6 +13,10 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.entity.EntityTickList;
 import net.minecraft.world.level.BlockEventData;
 import net.minecraft.network.protocol.game.ClientboundBlockEventPacket;
+import net.minecraft.network.PacketListener;
+import dev.pandor.regionium.access.PacketProcessorRegioniumAccess;
+import net.minecraft.network.PacketProcessor;
+import dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess;
 import dev.pandor.regionium.mixins.DistanceManagerRegioniumAccessorMixin;
 import dev.pandor.regionium.mixins.SimulationChunkTrackerRegioniumAccessorMixin;
 import dev.pandor.regionium.mixins.ChunkMapRegioniumInvokerMixin;
@@ -49,6 +53,7 @@ public final class RegioniumScheduler implements AutoCloseable {
     private final RegioniumChunkLeaseManager chunkLeases = new RegioniumChunkLeaseManager();
     private final RegioniumRegionizer regionizer;
     private final RegioniumEntityTracker entityTracker = new RegioniumEntityTracker();
+    private final PacketProcessor globalPacketProcessor = new PacketProcessor(null);
     private final Object tickLock = new Object();
     private final Map<Object, RegioniumRegion> pendingTransfers = new IdentityHashMap<>();
     private final Map<ServerLevel, List<BlockEventData>> deferredBlockEvents = new IdentityHashMap<>();
@@ -60,9 +65,12 @@ public final class RegioniumScheduler implements AutoCloseable {
      */
     private final Set<ChunkExecutionKey> activeChunkExecutions = ConcurrentHashMap.newKeySet();
     private final Set<ServerLevel> knownLevels = ConcurrentHashMap.newKeySet();
+    private final Set<ServerLevel> initializedRegionizers = ConcurrentHashMap.newKeySet();
     private final Map<ServerLevel, RegioniumWorldData> worldData = new ConcurrentHashMap<>();
     private final Map<ServerLevel, Long> scheduledTickDispatchTime = new ConcurrentHashMap<>();
     private final Map<ServerLevel, Object> scheduledTickDispatchLocks = new ConcurrentHashMap<>();
+    private final Map<Object, ServerLevel> vanillaTickOwners = new java.util.IdentityHashMap<>();
+    private final Map<ServerPlayer, Long> playerOwnershipChunks = new java.util.IdentityHashMap<>();
     private record ChunkExecutionKey(ServerLevel level, long pos) {}
 
     private volatile boolean running;
@@ -132,6 +140,22 @@ public final class RegioniumScheduler implements AutoCloseable {
         return entityTracker;
     }
 
+    public <T extends PacketListener> void scheduleGlobalPacket(T listener, net.minecraft.network.protocol.Packet<T> packet) {
+        globalPacketProcessor.scheduleIfPossible(listener, packet);
+    }
+
+    public void drainGlobalPackets() {
+        dev.pandor.regionium.access.PacketProcessorRegioniumAccess access = (dev.pandor.regionium.access.PacketProcessorRegioniumAccess) (Object) globalPacketProcessor;
+        while (access.regionium$executeSinglePacket()) {
+            // Global login/configuration packets are intentionally drained here.
+        }
+    }
+
+    /** Packet arrival is already lock-free; the region loop is independently clocked. */
+    public void notifyRegionPackets(RegioniumWorldData region) {
+        // The next regional tick drains the player's queue. No global wakeup/barrier is used.
+    }
+
     /**
      * Folia-style ownership check: being on a region worker is not enough;
      * the current region must actually own the object being touched.
@@ -175,6 +199,7 @@ public final class RegioniumScheduler implements AutoCloseable {
             debugTick = tick;
             tickInProgress.set(true);
         }
+        drainGlobalPackets();
     }
     public static long currentDebugTick() {
         return debugTick;
@@ -231,8 +256,22 @@ public final class RegioniumScheduler implements AutoCloseable {
     public void registerLevel(ServerLevel level) {
         level = Objects.requireNonNull(level, "level");
         knownLevels.add(level);
-        regionizer.rebalance(level);
+        var visibleAtRegistration = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+            level.getChunkSource().chunkMap).regionium$getVisibleChunkMap();
+        boolean needsInitialRegionizer = !visibleAtRegistration.isEmpty()
+            && (initializedRegionizers.add(level)
+                || regionizer.owner(level, visibleAtRegistration.keySet().iterator().nextLong()) == null);
+        if (needsInitialRegionizer) {
+            // Folia's regionizer is not rebuilt from the global 20 TPS loop.
+            // It is initialized when chunk ownership first exists, then its
+            // topology changes through chunk lifecycle / merge / split logic.
+            regionizer.rebalance(level);
+        }
         RegioniumWorldData data = worldData.computeIfAbsent(level, RegioniumWorldData::new);
+        synchronized (vanillaTickOwners) {
+            vanillaTickOwners.put(level.getBlockTicks(), level);
+            vanillaTickOwners.put(level.getFluidTicks(), level);
+        }
 
         // Player-region membership is a server-thread boundary operation.
         // Never rebalance from a region worker through worldData().
@@ -244,13 +283,94 @@ public final class RegioniumScheduler implements AutoCloseable {
         for (ServerPlayer player : livePlayers) {
             RegioniumRegion owner = regionizer.regionFor(player);
             if (owner != null) {
-                data.add(player, owner);
+                long chunk = player.chunkPosition().pack();
+                Long previousChunk = playerOwnershipChunks.get(player);
+                RegioniumRegion explicitOwner = ownership.ownerOf(player);
+
+                // A manual /regionium transfer is an execution-owner override.
+                // Keep it while the player remains in the same chunk; once the
+                // player actually moves, normal Folia-style chunk ownership wins.
+                if (previousChunk == null) {
+                    playerOwnershipChunks.put(player, chunk);
+                    if (explicitOwner == null) {
+                        ownership.assign(player, owner);
+                    }
+                } else if (previousChunk.longValue() != chunk) {
+                    playerOwnershipChunks.put(player, chunk);
+                    if (explicitOwner != null && explicitOwner != owner) {
+                        ownership.transfer(player, owner);
+                    }
+                }
+
+                RegioniumRegion executionOwner = ownership.ownerOf(player);
+                if (executionOwner == null) {
+                    executionOwner = owner;
+                    ownership.assign(player, executionOwner);
+                }
+                data.add(player, executionOwner);
+                ((ServerPlayerRegioniumPacketAccess) (Object) player).regionium$updateRegion(data);
+            }
+        }
+
+        // Rebuild the region-local chunk/tick containers from the same
+        // visible-chunk snapshot used by the Folia-style regionizer.
+        var visible = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+            level.getChunkSource().chunkMap).regionium$getVisibleChunkMap();
+        for (var entry : visible.long2ObjectEntrySet()) {
+            long packed = entry.getLongKey();
+            RegioniumRegion owner = regionizer.owner(level, packed);
+            if (owner == null) continue;
+            var chunk = entry.getValue().getTickingChunk();
+            if (chunk != null) {
+                data.addChunk(chunk, owner);
+                data.tickingChunks(owner).add(chunk);
+                data.entityTickingChunks(owner).add(chunk);
             }
         }
     }
 
     public RegioniumWorldData worldData(ServerLevel level) {
         return worldData.computeIfAbsent(level, RegioniumWorldData::new);
+    }
+
+    public ServerLevel levelForVanillaTicks(Object ticks) {
+        synchronized (vanillaTickOwners) {
+            return vanillaTickOwners.get(ticks);
+        }
+    }
+
+    /** Routes a vanilla scheduled tick into the Folia-style region queue. */
+    public boolean routeScheduledTick(ServerLevel level, net.minecraft.world.ticks.ScheduledTick<?> tick) {
+        RegioniumRegion region = chunkLeases.owner(level, net.minecraft.world.level.ChunkPos.pack(tick.pos()));
+        if (region == null) {
+            region = regionizer.owner(level, net.minecraft.world.level.ChunkPos.pack(tick.pos()));
+        }
+        if (region == null) {
+            return false;
+        }
+
+        RegioniumWorldData data = worldData(level);
+        long globalNow = level.getLevelData().getGameTime();
+        long delay = Math.max(0L, tick.triggerTick() - globalNow);
+        long trigger = data.redstoneTime(region) + delay;
+        long order = data.nextSubTickOrder(region);
+        if (tick.type() instanceof net.minecraft.world.level.block.Block block) {
+            @SuppressWarnings("unchecked")
+            var target = new net.minecraft.world.ticks.ScheduledTick<>(
+                (net.minecraft.world.level.block.Block) tick.type(), tick.pos(), trigger, tick.priority(), order
+            );
+            data.blockTicks(region).schedule(target);
+            return true;
+        }
+        if (tick.type() instanceof net.minecraft.world.level.material.Fluid fluid) {
+            @SuppressWarnings("unchecked")
+            var target = new net.minecraft.world.ticks.ScheduledTick<>(
+                (net.minecraft.world.level.material.Fluid) tick.type(), tick.pos(), trigger, tick.priority(), order
+            );
+            data.fluidTicks(region).schedule(target);
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -435,41 +555,38 @@ public final class RegioniumScheduler implements AutoCloseable {
      * This keeps the shared LevelTicks structure serialized without making
      * the actual block/fluid callback run on the wrong region.
      */
+    /**
+     * Ticks the current region's private LevelTicks queue.
+     *
+     * Folia does not drain one shared ServerLevel queue and then fan callbacks
+     * out to workers. The queue itself is part of RegionizedWorldData. The
+     * server thread therefore never calls LevelTicks.tick() for simulation.
+     */
     public <T> void tickScheduledTicksRegionally(
         ServerLevel level,
-        net.minecraft.world.ticks.LevelTicks<T> ticks,
-        long gameTime,
+        net.minecraft.world.ticks.LevelTicks<T> vanillaTicks,
         int maxTicks,
         java.util.function.BiConsumer<net.minecraft.core.BlockPos, T> callback
     ) {
-        Object lock = scheduledTickDispatchLocks.computeIfAbsent(level, ignored -> new Object());
-        synchronized (lock) {
-            long previous = scheduledTickDispatchTime.getOrDefault(level, Long.MIN_VALUE);
-            if (gameTime <= previous) {
-                return;
-            }
-            scheduledTickDispatchTime.put(level, gameTime);
+        RegioniumRegion region = RegioniumContext.requireRegionThread();
+        RegioniumWorldData data = worldData(level);
+        long regionTime = data.redstoneTime(region);
 
-            ticks.tick(gameTime, maxTicks, (pos, value) -> {
-                RegioniumRegion target = chunkLeases.owner(
-                    level, net.minecraft.world.level.ChunkPos.pack(pos)
-                );
-                if (target == null) {
-                    target = ownerOf(level);
-                }
-                if (target == null) {
-                    return;
-                }
-
-                RegioniumRegion current = RegioniumContext.currentRegion();
-                Runnable action = () -> callback.accept(pos, value);
-                if (target == current) {
-                    action.run();
-                } else {
-                    target.execute(action);
-                }
-            });
+        net.minecraft.world.ticks.LevelTicks<T> local;
+        boolean isBlockQueue = vanillaTicks == ((dev.pandor.regionium.mixins.ServerLevelRegioniumAccessorMixin) level).regionium$getBlockTicks();
+        if (isBlockQueue) {
+            @SuppressWarnings("unchecked")
+            net.minecraft.world.ticks.LevelTicks<T> cast = (net.minecraft.world.ticks.LevelTicks<T>) data.blockTicks(region);
+            local = cast;
+        } else {
+            @SuppressWarnings("unchecked")
+            net.minecraft.world.ticks.LevelTicks<T> cast = (net.minecraft.world.ticks.LevelTicks<T>) data.fluidTicks(region);
+            local = cast;
         }
+
+        local.tick(regionTime, maxTicks, (pos, type) -> {
+            callback.accept(pos, type);
+        });
     }
 
     public void dispatchScheduledTick(ServerLevel level, net.minecraft.core.BlockPos pos, Runnable action) {
@@ -495,73 +612,42 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
     }
 
-    /**
-     * Region workers must never append directly to ServerLevel.blockEvents.
-     * That queue is drained by the server tick, so worker-generated events
-     * are deferred to the next server-thread collection pass.
-     */
+    /** Queues a block event directly into the owning region, like Folia. */
     public void deferBlockEvent(ServerLevel level, BlockEventData event) {
-        synchronized (tickLock) {
-            deferredBlockEvents.computeIfAbsent(level, ignored -> new ArrayList<>()).add(event);
+        RegioniumRegion region = chunkLeases.owner(level, net.minecraft.world.level.ChunkPos.pack(event.pos()));
+        if (region == null) {
+            region = RegioniumContext.currentRegion();
         }
-    }
-
-    /**
-     * Moves the current vanilla block-event batch onto region workers while
-     * preserving vanilla FIFO/reschedule semantics at the server boundary.
-     */
-    public void flushDeferredBlockEvents(ServerLevel level) {
-        synchronized (tickLock) {
-            var deferred = deferredBlockEvents.remove(level);
-            if (deferred == null || deferred.isEmpty()) {
-                return;
+        if (region == null) {
+            synchronized (tickLock) {
+                deferredBlockEvents.computeIfAbsent(level, ignored -> new ArrayList<>()).add(event);
             }
-            var access = (dev.pandor.regionium.mixins.ServerLevelRegioniumBlockEventAccessorMixin) level;
-            access.regionium$getBlockEvents().addAll(deferred);
+            return;
         }
+        worldData(level).deferredBlockEvents(region).add(event);
     }
 
-    public void dispatchBlockEvents(ServerLevel level) {
-        var access = (dev.pandor.regionium.mixins.ServerLevelRegioniumBlockEventAccessorMixin) level;
-        var events = access.regionium$getBlockEvents();
-        var reschedule = access.regionium$getBlockEventsToReschedule();
-        long debugTick = currentTick();
+    /** Executes only the current region's block-event queue. */
+    public void dispatchBlockEventsForRegion(ServerLevel level, RegioniumRegion region) {
+        var events = worldData(level).deferredBlockEvents(region);
 
-        while (!events.isEmpty()) {
-            BlockEventData event = events.removeFirst();
-            if (!level.shouldTickBlocksAt(net.minecraft.world.level.ChunkPos.pack(event.pos()))) {
-                reschedule.add(event);
+        for (BlockEventData event : List.copyOf(events)) {
+            long chunk = net.minecraft.world.level.ChunkPos.pack(event.pos());
+            if (chunkLeases.owner(level, chunk) != region) {
                 continue;
             }
 
-            RegioniumRegion target = chunkLeases.owner(level, net.minecraft.world.level.ChunkPos.pack(event.pos()));
-            if (target == null) {
-                target = ownerOf(level);
+            var state = level.getBlockState(event.pos());
+            if (state.is(event.block()) && state.triggerEvent(level, event.pos(), event.paramA(), event.paramB())) {
+                level.getServer().getPlayerList().broadcast(
+                    null,
+                    event.pos().getX(), event.pos().getY(), event.pos().getZ(),
+                    64.0,
+                    level.dimension(),
+                    new ClientboundBlockEventPacket(event.pos(), event.block(), event.paramA(), event.paramB())
+                );
             }
-            if (target == null || !target.enqueueTickPhase(debugTick, () -> runChunkLocked(level, event.pos(), () -> {
-                var state = level.getBlockState(event.pos());
-                if (state.is(event.block()) && state.triggerEvent(level, event.pos(), event.paramA(), event.paramB())) {
-                    level.getServer().getPlayerList().broadcast(
-                        null,
-                        event.pos().getX(), event.pos().getY(), event.pos().getZ(),
-                        64.0,
-                        level.dimension(),
-                        new ClientboundBlockEventPacket(event.pos(), event.block(), event.paramA(), event.paramB())
-                    );
-                }
-            }))) {
-                reschedule.add(event);
-            }
-        }
-
-        events.addAll(reschedule);
-        reschedule.clear();
-
-        synchronized (tickLock) {
-            var deferred = deferredBlockEvents.remove(level);
-            if (deferred != null) {
-                events.addAll(deferred);
-            }
+            events.remove(event);
         }
     }
 
@@ -686,6 +772,36 @@ public final class RegioniumScheduler implements AutoCloseable {
      * MinecraftServer's 20 TPS loop only maintains global bookkeeping. The
      * region clock owns the actual chunk/entity/block-entity tick body.</p>
      */
+    /**
+     * LevelTicks requires one LevelChunkTicks container for every chunk that
+     * belongs to the region. Vanilla owns those containers on LevelChunk, so
+     * refresh the region-local LevelTicks view immediately before simulation.
+     * This is deliberately done before ServerLevel.tick(): block placement can
+     * schedule a tick before the chunk-tick phase itself runs.
+     */
+    private void ensureRegionTickContainers(ServerLevel level, RegioniumRegion region) {
+        var data = worldData(level);
+        var visible = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+            level.getChunkSource().chunkMap).regionium$getVisibleChunkMap();
+
+        for (var entry : visible.long2ObjectEntrySet()) {
+            long packed = entry.getLongKey();
+            if (chunkLeases.owner(level, packed) != region) {
+                continue;
+            }
+
+            var chunk = entry.getValue().getTickingChunk();
+            if (chunk == null) {
+                int cx = net.minecraft.world.level.ChunkPos.getX(packed);
+                int cz = net.minecraft.world.level.ChunkPos.getZ(packed);
+                chunk = level.getChunkSource().getChunkNow(cx, cz);
+            }
+            if (chunk != null) {
+                data.addChunk(chunk, region);
+            }
+        }
+    }
+
     private void tickRegionBody(RegioniumRegion region) {
         final long tick = region.tickCount();
 
@@ -700,7 +816,20 @@ public final class RegioniumScheduler implements AutoCloseable {
                 // the chunks/entities owned by the current region.
                 RegioniumContext.enterWorld(worldData(level));
                 try {
+                    ensureRegionTickContainers(level, region);
+                    drainPacketsForRegion(level, region);
+                    tickConnectionsForRegion(level, region);
                     level.tick(() -> true);
+
+                    // Vanilla normally flushes ServerChunkCache's
+                    // chunkHoldersToBroadcast during its global chunk tick.
+                    // Regionium deliberately prevents that global tick from
+                    // consuming simulation work, so block changes would stay
+                    // queued until some later interaction forced a refresh.
+                    // Folia moves this queue into RegionizedWorldData and
+                    // broadcasts it from the owning region.
+                    broadcastChangedChunksForRegion(level, region);
+
                     entityTracker.tick(level, region);
                 } finally {
                     RegioniumContext.exitWorld();
@@ -715,6 +844,83 @@ public final class RegioniumScheduler implements AutoCloseable {
                 );
             }
         }
+    }
+
+    private void broadcastChangedChunksForRegion(ServerLevel level, RegioniumRegion region) {
+        var pending = worldData(level).chunkHoldersToBroadcast(region);
+
+        for (var holder : List.copyOf(pending)) {
+            var chunk = holder.getTickingChunk();
+            if (chunk == null) {
+                continue;
+            }
+
+            long packed = chunk.getPos().pack();
+            if (chunkLeases.owner(level, packed) != region) {
+                continue;
+            }
+
+            holder.broadcastChanges(chunk);
+            pending.remove(holder);
+        }
+    }
+
+    private void tickConnectionsForRegion(ServerLevel level, RegioniumRegion region) {
+        RegioniumWorldData data = worldData(level);
+        for (ServerPlayer player : List.copyOf(data.players(region))) {
+            if (!isOwnedByCurrentRegion(player)) {
+                continue;
+            }
+
+            Regionium.LOGGER.info(
+                "[CONNECTION-TICK] player={} region={} owner={} thread={}",
+                player.getGameProfile().name(),
+                region,
+                ownerOf(player),
+                Thread.currentThread().getName()
+            );
+            // Folia ticks each local player's Connection from the owning region.
+            player.connection.tick();
+        }
+    }
+
+    private void drainPacketsForRegion(ServerLevel level, RegioniumRegion region) {
+        RegioniumWorldData data = worldData(level);
+
+        /*
+         * Match Folia's region task loop: one packet per local player per
+         * pass, then immediately repeat while work remains. A single pass is
+         * not enough because normal Minecraft clients continuously generate
+         * movement/input packets. With only one packet consumed per 50 ms,
+         * the queue can grow by hundreds of packets and input appears seconds
+         * behind reality.
+         *
+         * Folia also bounds the region task loop, so do the same here instead
+         * of allowing a malicious/broken connection to monopolise a worker.
+         */
+        final long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10L);
+
+        do {
+            boolean processed = false;
+
+            for (ServerPlayer player : List.copyOf(data.players(region))) {
+                if (!isOwnedByCurrentRegion(player)) {
+                    continue;
+                }
+
+                dev.pandor.regionium.access.PacketProcessorRegioniumAccess access =
+                    (dev.pandor.regionium.access.PacketProcessorRegioniumAccess) (Object)
+                        ((ServerPlayerRegioniumPacketAccess) (Object) player).regionium$getPacketProcessor();
+
+                if (access.regionium$hasPackets()) {
+                    processed |= access.regionium$executeSinglePacket();
+                }
+            }
+
+            if (!processed || System.nanoTime() >= deadline) {
+                break;
+            }
+        } while (true);
     }
 
     private List<ServerLevel> snapshotLevels() {
@@ -870,6 +1076,10 @@ public final class RegioniumScheduler implements AutoCloseable {
      */
     public RegioniumRegion ownerOf(Object object) {
         if (object instanceof ServerPlayer player && player.level() instanceof ServerLevel level) {
+            RegioniumRegion explicitOwner = ownership.ownerOf(player);
+            if (explicitOwner != null) {
+                return explicitOwner;
+            }
             RegioniumRegion regionizedOwner = regionizer.regionFor(player);
             if (regionizedOwner != null) {
                 return regionizedOwner;
@@ -891,7 +1101,9 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
 
         ServerLevel level = null;
-        if (object instanceof ServerPlayer player) {
+        if (object instanceof ServerLevel serverLevel) {
+            level = serverLevel;
+        } else if (object instanceof ServerPlayer player) {
             level = (ServerLevel) player.level();
         } else if (object instanceof Entity entity && entity.level() instanceof ServerLevel serverLevel) {
             level = serverLevel;
@@ -983,10 +1195,29 @@ public final class RegioniumScheduler implements AutoCloseable {
      * <p>The owner is resolved when this method is called. The task itself is
      * then executed by that region's next tick.</p>
      */
+    /** Executes work on the region owning a specific world position. */
+    public void execute(ServerLevel level, net.minecraft.core.BlockPos pos, Runnable action) {
+        Objects.requireNonNull(level, "level");
+        Objects.requireNonNull(pos, "pos");
+        Objects.requireNonNull(action, "action");
+
+        RegioniumRegion owner = chunkLeases.owner(level, net.minecraft.world.level.ChunkPos.pack(pos));
+        if (owner == null) {
+            owner = regionizer.owner(level, net.minecraft.world.level.ChunkPos.pack(pos));
+        }
+        if (owner == null) {
+            throw new IllegalStateException("No region owns world position " + pos);
+        }
+        owner.execute(action);
+    }
+
     public void execute(Object object, Runnable action) {
         Objects.requireNonNull(object, "object");
         Objects.requireNonNull(action, "action");
 
+        if (ownership.ownerOf(object) == null) {
+            ownerOf(object);
+        }
         if (ownership.ownerOf(object) == null) {
             throw new IllegalStateException("Object has no Regionium owner: " + object);
         }
@@ -1040,7 +1271,10 @@ public final class RegioniumScheduler implements AutoCloseable {
                 || regions.get(destination.id()) != destination) {
                 throw new IllegalArgumentException("Region does not belong to this scheduler");
             }
-            if (ownership.ownerOf(object) == null && !pendingTransfers.containsKey(object)) {
+            // Players/entities may be owned by the regionizer without having
+            // an entry in the auxiliary ownership table yet. Resolve their
+            // real current owner before accepting the migration request.
+            if (ownerOf(object) == null && !pendingTransfers.containsKey(object)) {
                 throw new IllegalStateException("Cannot transfer an object without an owner: " + object);
             }
             pendingTransfers.put(object, destination);
@@ -1070,6 +1304,19 @@ public final class RegioniumScheduler implements AutoCloseable {
             ownership.transfer(object, destination);
 
             if (object instanceof ServerPlayer player && source != destination) {
+                ServerLevel level = (ServerLevel) player.level();
+                RegioniumWorldData data = worldData(level);
+
+                // Move the player between the region-local mailboxes at the
+                // same boundary as ownership. PacketProcessor itself is
+                // player-owned and therefore remains the same queue; what
+                // changes is which region is allowed to drain that queue.
+                if (source != null) {
+                    data.remove(player, source);
+                }
+                data.add(player, destination);
+                ((ServerPlayerRegioniumPacketAccess) (Object) player).regionium$updateRegion(data);
+
                 Regionium.LOGGER.info(
                     "Player {} moved Region {} -> {} ({} -> {})",
                     player.getGameProfile().name(),

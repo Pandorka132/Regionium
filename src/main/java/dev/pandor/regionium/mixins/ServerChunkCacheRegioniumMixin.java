@@ -3,8 +3,12 @@ package dev.pandor.regionium.mixins;
 import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.server.level.ChunkMap;
+import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.core.SectionPos;
+import net.minecraft.world.level.ChunkPos;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -23,6 +27,37 @@ public abstract class ServerChunkCacheRegioniumMixin {
      * The global server thread separately calls ServerChunkCache.tick(...,
      * false) for ticket/unload maintenance.
      */
+    @Inject(method = "blockChanged", at = @At("HEAD"), cancellable = true)
+    private void regionium$regionLocalBlockChanged(
+        net.minecraft.core.BlockPos pos,
+        CallbackInfo ci
+    ) {
+        if (!RegioniumContext.isRegionThread()) {
+            return;
+        }
+
+        var current = RegioniumContext.currentRegion();
+        if (current == null) {
+            return;
+        }
+
+        int xc = SectionPos.blockToSectionCoord(pos.getX());
+        int zc = SectionPos.blockToSectionCoord(pos.getZ());
+        ChunkHolder holder = ((ChunkMapRegioniumVisibleAccessorMixin) chunkMap)
+            .regionium$getVisibleChunkMap().get(ChunkPos.pack(xc, zc));
+
+        if (holder != null && holder.blockChanged(pos)) {
+            Regionium.scheduler().worldData(level)
+                .chunkHoldersToBroadcast(current)
+                .add(holder);
+        }
+
+        // The vanilla global queue is deliberately not touched on a region
+        // thread. Its queue is a single global mutable structure and would
+        // race when multiple regions modify blocks simultaneously.
+        ci.cancel();
+    }
+
     @Inject(method = "tick", at = @At("HEAD"), cancellable = true)
     private void regionium$regionLocalChunkTick(
         java.util.function.BooleanSupplier haveTime,
