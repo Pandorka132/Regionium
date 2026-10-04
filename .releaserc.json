@@ -33,7 +33,7 @@
       {
         "assets": [
           {
-            "path": "build/libs/*.jar"
+            "path": "versions/*/build/libs/*.jar"
           }
         ]
       }
