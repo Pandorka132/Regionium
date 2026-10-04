@@ -71,7 +71,7 @@ jobs:
 
       - name: "🧪 Run Dev Build"
         if: ${{ steps.get-next-version.outputs.new_release_published != 'true' }}
-        run: ./gradlew runGameTestServer buildAndCollect --stacktrace
+        run: ./gradlew buildAndCollect
 
       - name: "🏗️ Build, Test & Release"
         if: ${{ steps.get-next-version.outputs.new_release_published == 'true' }}
@@ -100,6 +100,4 @@ jobs:
         with:
           name: Artifacts
           path: |
-            build/libs/*.jar
-            build/reports/**/*
-            versions/*/build/reports/**/*
+            versions/*/build/libs/*
