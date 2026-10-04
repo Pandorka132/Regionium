@@ -119,19 +119,32 @@ public final class RegioniumChunkLeaseManager {
         }
     }
 
-    /** Returns whether this region currently owns at least one simulation chunk. */
+    /** Returns whether the Folia-style regionizer gives this region any chunks. */
     public synchronized boolean hasOwnedChunks(ServerLevel level, RegioniumRegion region) {
-        for (Map.Entry<ChunkKey, RegioniumRegion> entry : leases.entrySet()) {
-            if (entry.getKey().level() == level && entry.getValue() == region) {
+        return Regionium.scheduler().regionizer().activeRegions().contains(region)
+            && level.getChunkSource().getLoadedChunksCount() > 0
+            && !Regionium.scheduler().worldData(level).chunks(region).isEmpty();
+    }
+
+    /** Returns the authoritative Folia-style region owner for this chunk. */
+    public synchronized RegioniumRegion owner(ServerLevel level, long chunkPos) {
+        RegioniumRegion region = Regionium.scheduler().regionizer().owner(level, chunkPos);
+        if (region != null) {
+            return region;
+        }
+        return leases.get(new ChunkKey(level, chunkPos));
+    }
+
+    private boolean hasRegionChunk(ServerLevel level, RegioniumRegion region) {
+        // Avoid maintaining a second ownership graph. The regionizer is the
+        // source of truth; this compatibility method is only used by old
+        // scheduler paths.
+        for (ServerPlayer player : level.players()) {
+            if (Regionium.scheduler().regionizer().regionFor(player) == region) {
                 return true;
             }
         }
         return false;
-    }
-
-    /** Returns the currently leased region, or null for render-only/unleased chunks. */
-    public synchronized RegioniumRegion owner(ServerLevel level, long chunkPos) {
-        return leases.get(new ChunkKey(level, chunkPos));
     }
 
     /** Returns true when two player simulation areas intersect. */

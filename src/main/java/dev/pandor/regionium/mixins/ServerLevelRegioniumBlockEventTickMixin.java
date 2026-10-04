@@ -12,9 +12,11 @@ public abstract class ServerLevelRegioniumBlockEventTickMixin {
     @Inject(method = "runBlockEvents", at = @At("HEAD"), cancellable = true)
     private void regionium$dispatchBlockEvents(CallbackInfo ci) {
         ServerLevel level = (ServerLevel) (Object) this;
-        Regionium.scheduler().flushDeferredBlockEvents(level);
-        Regionium.scheduler().dispatchBlockEvents(level);
-        Regionium.scheduler().finishRegionalPhase(level, "block-events");
-        ci.cancel();
+        var region = dev.pandor.regionium.core.RegioniumContext.currentRegion();
+        if (region != null) {
+            Regionium.scheduler().dispatchBlockEventsForRegion(level, region);
+            Regionium.scheduler().finishRegionalPhase(level, "block-events");
+            ci.cancel();
+        }
     }
 }

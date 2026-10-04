@@ -1,197 +1,195 @@
 package dev.pandor.regionium.core;
 
 import dev.pandor.regionium.Regionium;
-import net.minecraft.server.level.DistanceManager;
+import dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin;
+import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
+import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.ChunkPos;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.HashSet;
 
 /**
- * Region membership modelled after Folia's threaded regionizer.
+ * Fabric port of Folia's section based ThreadedRegionizer.
  *
- * <p>A region is a connected component of player simulation areas. When two
- * simulation areas touch, their work must execute in one region because both
- * players can synchronously observe and mutate the same simulation space.
- * Components may merge when players approach and split when they separate.</p>
- *
- * <p>The vanilla world remains shared. This class only owns the mapping from
- * live players to Regionium execution regions.</p>
+ * Paper's SWMR/concurrentutil structures are intentionally not copied here:
+ * Fabric does not ship Paper/Moonrise. The region topology and ownership
+ * rules are kept, while the backing maps use ordinary Java collections.
  */
 public final class RegioniumRegionizer {
+    private static final int SECTION_SHIFT = 4;
+    private static final int MERGE_RADIUS = 1;
+
     private final List<RegioniumRegion> regions;
-    private final Map<ServerPlayer, RegioniumRegion> playerRegions = new IdentityHashMap<>();
-    private final Set<RegioniumRegion> activeRegions = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Map<ServerLevel, Map<Long, RegioniumRegion>> chunkOwners =
+        Collections.synchronizedMap(new IdentityHashMap<>());
+    private final Map<ServerLevel, Map<ServerPlayer, RegioniumRegion>> playerRegions =
+        Collections.synchronizedMap(new IdentityHashMap<>());
+    private final Set<RegioniumRegion> activeRegions =
+        Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
 
     public RegioniumRegionizer(List<RegioniumRegion> regions) {
         this.regions = List.copyOf(regions);
-        if (regions.isEmpty()) {
-            throw new IllegalArgumentException("At least one region is required");
-        }
+        if (regions.isEmpty()) throw new IllegalArgumentException("At least one region is required");
     }
 
-    /**
-     * Recomputes connected components from the current player simulation
-     * areas. This is deliberately a server-thread operation and only changes
-     * membership at a scheduler boundary.
-     */
+    /** Rebuilds ownership from Folia-style loaded chunk sections. */
     public synchronized void rebalance(ServerLevel level) {
-        List<ServerPlayer> players = new ArrayList<>(level.players());
-        if (players.isEmpty()) {
-            for (RegioniumRegion region : regions) {
-                activeRegions.remove(region);
-            }
-            playerRegions.clear();
+        Long2ObjectLinkedOpenHashMap<ChunkHolder> visible =
+            ((ChunkMapRegioniumVisibleAccessorMixin) level.getChunkSource().chunkMap)
+                .regionium$getVisibleChunkMap();
+
+        Map<Long, RegioniumRegion> oldOwners = chunkOwners.getOrDefault(level, Map.of());
+        Map<Long, RegioniumRegion> nextOwners = new java.util.HashMap<>();
+        Set<Long> sections = new LinkedHashSet<>();
+
+        for (long chunkKey : visible.keySet()) {
+            sections.add(sectionKey(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey)));
+        }
+
+        if (sections.isEmpty()) {
+            chunkOwners.put(level, nextOwners);
+            playerRegions.computeIfAbsent(level, ignored -> new IdentityHashMap<>()).clear();
             return;
         }
 
-        int radius = simulationDistance(level);
-        Map<ServerPlayer, Set<ServerPlayer>> graph = new IdentityHashMap<>();
-        for (ServerPlayer player : players) {
-            graph.put(player, java.util.Collections.newSetFromMap(new IdentityHashMap<>()));
-        }
-
-        for (int i = 0; i < players.size(); i++) {
-            ServerPlayer a = players.get(i);
-            for (int j = i + 1; j < players.size(); j++) {
-                ServerPlayer b = players.get(j);
-                if (areasOverlap(a, b, radius)) {
-                    graph.get(a).add(b);
-                    graph.get(b).add(a);
+        Map<Long, Set<Long>> graph = new java.util.HashMap<>();
+        for (long section : sections) graph.put(section, new LinkedHashSet<>());
+        for (long section : sections) {
+            int sx = sectionX(section), sz = sectionZ(section);
+            for (int dz = -MERGE_RADIUS; dz <= MERGE_RADIUS; dz++) {
+                for (int dx = -MERGE_RADIUS; dx <= MERGE_RADIUS; dx++) {
+                    if (dx == 0 && dz == 0) continue;
+                    long other = packSection(sx + dx, sz + dz);
+                    if (sections.contains(other)) graph.get(section).add(other);
                 }
             }
         }
 
-        List<List<ServerPlayer>> components = new ArrayList<>();
-        Set<ServerPlayer> visited = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        for (ServerPlayer root : players) {
-            if (!visited.add(root)) {
-                continue;
-            }
-            List<ServerPlayer> component = new ArrayList<>();
-            ArrayDeque<ServerPlayer> queue = new ArrayDeque<>();
+        List<List<Long>> components = new ArrayList<>();
+        Set<Long> visited = new LinkedHashSet<>();
+        for (long root : sections) {
+            if (!visited.add(root)) continue;
+            List<Long> component = new ArrayList<>();
+            ArrayDeque<Long> queue = new ArrayDeque<>();
             queue.add(root);
             while (!queue.isEmpty()) {
-                ServerPlayer player = queue.removeFirst();
-                component.add(player);
-                for (ServerPlayer next : graph.get(player)) {
-                    if (visited.add(next)) {
-                        queue.addLast(next);
-                    }
-                }
+                long current = queue.removeFirst();
+                component.add(current);
+                for (long next : graph.get(current)) if (visited.add(next)) queue.addLast(next);
             }
             components.add(component);
         }
 
-        components.sort(Comparator
-            .comparingInt((List<ServerPlayer> c) -> c.size()).reversed()
-            .thenComparing(c -> c.getFirst().getUUID()));
+        components.sort(Comparator.<List<Long>>comparingInt(List::size).reversed()
+            .thenComparingLong(c -> c.getFirst()));
 
-        Set<RegioniumRegion> used = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        Map<ServerPlayer, RegioniumRegion> next = new IdentityHashMap<>();
+        Set<RegioniumRegion> used = Collections.newSetFromMap(new IdentityHashMap<>());
+        Map<Long, RegioniumRegion> sectionOwners = new java.util.HashMap<>();
 
-        // Preserve an existing region for a component whenever possible.
-        for (List<ServerPlayer> component : components) {
+        for (List<Long> component : components) {
             RegioniumRegion selected = null;
-            for (ServerPlayer player : component) {
-                RegioniumRegion previous = playerRegions.get(player);
-                if (previous != null && !used.contains(previous)) {
-                    selected = previous;
+            for (Map.Entry<Long, RegioniumRegion> old : oldOwners.entrySet()) {
+                int cx = ChunkPos.getX(old.getKey()), cz = ChunkPos.getZ(old.getKey());
+                if (component.contains(sectionKey(cx, cz)) && !used.contains(old.getValue())) {
+                    selected = old.getValue();
                     break;
                 }
             }
-            if (selected == null) {
-                selected = leastLoadedUnused(used);
-            }
-            if (selected == null) {
-                // More connected components than workers: the only safe
-                // fallback is to coalesce them into the least-loaded region.
-                selected = leastLoaded(components, next);
-            }
+            if (selected == null) selected = leastLoadedUnused(used);
+            if (selected == null) selected = leastLoaded();
 
             used.add(selected);
             activeRegions.add(selected);
-            for (ServerPlayer player : component) {
-                next.put(player, selected);
-            }
+            for (long section : component) sectionOwners.put(section, selected);
         }
 
-        playerRegions.clear();
-        playerRegions.putAll(next);
-
-        for (RegioniumRegion region : regions) {
-            if (!used.contains(region)) {
-                activeRegions.remove(region);
-            }
+        for (long chunkKey : visible.keySet()) {
+            RegioniumRegion owner = sectionOwners.get(
+                sectionKey(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey))
+            );
+            if (owner != null) nextOwners.put(chunkKey, owner);
         }
 
-        Regionium.LOGGER.debug(
-            "[REGIONIZER] level={} players={} components={} activeRegions={}",
-            level.dimension().identifier(), players.size(), components.size(), activeRegions.size()
-        );
+        chunkOwners.put(level, nextOwners);
+        Map<ServerPlayer, RegioniumRegion> players =
+            playerRegions.computeIfAbsent(level, ignored -> new IdentityHashMap<>());
+        players.clear();
+        for (ServerPlayer player : level.players()) {
+            RegioniumRegion owner = nextOwners.get(player.chunkPosition().pack());
+            if (owner == null) owner = nearestOwner(nextOwners, player.chunkPosition());
+            if (owner != null) players.put(player, owner);
+        }
+
+        for (RegioniumRegion region : regions) if (!used.contains(region)) activeRegions.remove(region);
+
+        Regionium.LOGGER.debug("[FOLIA-REGIONIZER] level={} chunks={} sections={} components={} active={}",
+            level.dimension().identifier(), nextOwners.size(), sections.size(), components.size(), activeRegions.size());
     }
 
     public synchronized RegioniumRegion regionFor(ServerPlayer player) {
-        return playerRegions.get(player);
+        if (!(player.level() instanceof ServerLevel level)) return null;
+        RegioniumRegion owner = owner(level, player.chunkPosition().pack());
+        if (owner != null) return owner;
+        return playerRegions.getOrDefault(level, Map.of()).get(player);
     }
 
-    public synchronized boolean isActive(RegioniumRegion region) {
-        return activeRegions.contains(region);
+    public synchronized RegioniumRegion owner(ServerLevel level, long chunkKey) {
+        Map<Long, RegioniumRegion> owners = chunkOwners.get(level);
+        return owners == null ? null : owners.get(chunkKey);
     }
+
+    public synchronized boolean isActive(RegioniumRegion region) { return activeRegions.contains(region); }
 
     public synchronized Set<ServerPlayer> players(RegioniumRegion region) {
-        Set<ServerPlayer> result = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        for (Map.Entry<ServerPlayer, RegioniumRegion> entry : playerRegions.entrySet()) {
-            if (entry.getValue() == region) {
-                result.add(entry.getKey());
+        Set<ServerPlayer> result = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Map<ServerPlayer, RegioniumRegion> players : playerRegions.values()) {
+            for (Map.Entry<ServerPlayer, RegioniumRegion> entry : players.entrySet()) {
+                if (entry.getValue() == region) result.add(entry.getKey());
             }
         }
         return Set.copyOf(result);
     }
 
+    public synchronized Set<RegioniumRegion> activeRegions() { return Set.copyOf(activeRegions); }
+
     private RegioniumRegion leastLoadedUnused(Set<RegioniumRegion> used) {
-        return regions.stream()
-            .filter(region -> !used.contains(region))
-            .min(Comparator.comparingInt(region -> players(region).size()))
-            .orElse(null);
+        return regions.stream().filter(r -> !used.contains(r))
+            .min(Comparator.comparingInt(r -> players(r).size())).orElse(null);
     }
 
-    private RegioniumRegion leastLoaded(
-        List<List<ServerPlayer>> components,
-        Map<ServerPlayer, RegioniumRegion> assignments
-    ) {
-        Map<RegioniumRegion, Integer> counts = new IdentityHashMap<>();
-        for (RegioniumRegion region : regions) {
-            counts.put(region, 0);
-        }
-        for (RegioniumRegion region : assignments.values()) {
-            counts.merge(region, 1, Integer::sum);
-        }
-        return regions.stream()
-            .min(Comparator.comparingInt(region -> counts.get(region)))
+    private RegioniumRegion leastLoaded() {
+        return regions.stream().min(Comparator.comparingInt(r -> players(r).size()))
             .orElse(regions.getFirst());
     }
 
-    private static int simulationDistance(ServerLevel level) {
-        DistanceManager distanceManager = level.getChunkSource().chunkMap.getDistanceManager();
-        try {
-            return ((dev.pandor.regionium.mixins.DistanceManagerRegioniumAccessorMixin) distanceManager)
-                .regionium$getSimulationDistance();
-        } catch (Throwable ignored) {
-            return 8;
+    private static RegioniumRegion nearestOwner(Map<Long, RegioniumRegion> owners, ChunkPos pos) {
+        RegioniumRegion best = null;
+        int bestDistance = Integer.MAX_VALUE;
+        for (Map.Entry<Long, RegioniumRegion> entry : owners.entrySet()) {
+            int distance = Math.abs(ChunkPos.getX(entry.getKey()) - pos.x())
+                + Math.abs(ChunkPos.getZ(entry.getKey()) - pos.z());
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = entry.getValue();
+            }
         }
+        return best;
     }
 
-    private static boolean areasOverlap(ServerPlayer a, ServerPlayer b, int radius) {
-        int dx = Math.abs(a.chunkPosition().x() - b.chunkPosition().x());
-        int dz = Math.abs(a.chunkPosition().z() - b.chunkPosition().z());
-        return dx <= radius * 2 && dz <= radius * 2;
+    private static long sectionKey(int chunkX, int chunkZ) {
+        return packSection(chunkX >> SECTION_SHIFT, chunkZ >> SECTION_SHIFT);
     }
+    private static long packSection(int x, int z) { return ((long)x << 32) ^ (z & 0xffffffffL); }
+    private static int sectionX(long key) { return (int)(key >> 32); }
+    private static int sectionZ(long key) { return (int)key; }
 }

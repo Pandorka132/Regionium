@@ -45,3 +45,6 @@ replay_*.log
 *.jfr
 
 
+
+# Local upstream Folia reference (not part of Regionium)
+.folia-reference/
