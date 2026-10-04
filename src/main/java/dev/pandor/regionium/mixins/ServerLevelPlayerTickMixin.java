@@ -9,12 +9,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ServerPlayer.class)
 public abstract class ServerLevelPlayerTickMixin {
-    @Inject(method = "doTick", at = @At("HEAD"), cancellable = true)
-    private void regionium$offloadPlayerTick(CallbackInfo ci) {
-        if (!dev.pandor.regionium.core.RegioniumContext.isRegionThread()) {
-            ServerPlayer player = (ServerPlayer) (Object) this;
-            Regionium.scheduler().execute(0, player::doTick);
-            ci.cancel();
-        }
-    }
+    /*
+     * ServerPlayer.doTick() is part of the normal EntityTickList traversal.
+     * ServerLevelEntityTickRegioniumMixin already moves that traversal to the
+     * owning region. Re-dispatching doTick here would recurse through the
+     * mailbox and, worse, used a hard-coded region id.
+     *
+     * Keep this mixin as a compatibility hook, but deliberately do not
+     * intercept the vanilla player tick.
+     */
 }
