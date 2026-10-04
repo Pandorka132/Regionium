@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - beta
+      - folia
   pull_request:
   merge_group:
   workflow_dispatch:
@@ -100,6 +101,4 @@ jobs:
         with:
           name: Artifacts
           path: |
-            build/libs/*.jar
-            build/reports/**/*
             versions/*/build/libs/*
