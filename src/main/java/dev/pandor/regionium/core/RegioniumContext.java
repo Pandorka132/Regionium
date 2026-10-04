@@ -14,16 +14,31 @@ import java.util.Objects;
  */
 public final class RegioniumContext {
     private static final ThreadLocal<RegioniumRegion> CURRENT_REGION = new ThreadLocal<>();
+    private static final ThreadLocal<RegioniumWorldData> CURRENT_WORLD_DATA = new ThreadLocal<>();
 
     private RegioniumContext() {
     }
 
     public static void enter(RegioniumRegion region) {
         CURRENT_REGION.set(Objects.requireNonNull(region, "region"));
+        CURRENT_WORLD_DATA.remove();
+    }
+
+    public static void enterWorld(RegioniumWorldData data) {
+        CURRENT_WORLD_DATA.set(Objects.requireNonNull(data, "data"));
+    }
+
+    public static void exitWorld() {
+        CURRENT_WORLD_DATA.remove();
     }
 
     public static void exit() {
+        CURRENT_WORLD_DATA.remove();
         CURRENT_REGION.remove();
+    }
+
+    public static @Nullable RegioniumWorldData currentWorldData() {
+        return CURRENT_WORLD_DATA.get();
     }
 
     public static @Nullable RegioniumRegion currentRegion() {
