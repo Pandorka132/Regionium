@@ -18,7 +18,7 @@ public final class ExampleGameTests {
     public ExampleGameTests() {
         Registry.register(
             BuiltInRegistries.TEST_FUNCTION,
-            Identifier.fromNamespaceAndPath(Regionium.MOD_ID, NOOP_TEST_FUNCTION),
+            Identifier.fromNamespaceAndPath(Regionium.MOD_ID.toLowerCase(), NOOP_TEST_FUNCTION),
             ExampleGameTests::noop
         );
     }
