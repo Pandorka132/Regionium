@@ -1,6 +1,9 @@
 # Regionium
 
 Multithreading in Fabric Minecraft!
+
+The architecture's idea is based on [Folia](https://github.com/papermc/folia)
+
 Work in progress, might be really unstable!
 Use at your own risk!
 
