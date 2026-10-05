@@ -7,6 +7,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * A single independently ticking Regionium region.
@@ -22,6 +23,9 @@ public final class RegioniumRegion {
     private final AtomicBoolean ticking = new AtomicBoolean();
     private final AtomicBoolean tickLoopStarted = new AtomicBoolean();
     private final AtomicBoolean stopRequested = new AtomicBoolean();
+    private final AtomicBoolean externallyDriven = new AtomicBoolean();
+    private final Queue<CompletableFuture<Void>> externalTicks = new ConcurrentLinkedQueue<>();
+    private volatile Thread workerThread;
     private final AtomicLongHolder tickCount = new AtomicLongHolder();
     private volatile Runnable tickBody = () -> {};
 
@@ -70,14 +74,45 @@ public final class RegioniumRegion {
         workers.execute(this::runTickLoop);
     }
 
+    void setExternallyDriven(boolean value) {
+        externallyDriven.set(value);
+    }
+
+    CompletableFuture<Void> requestExternallyDrivenTick() {
+        CompletableFuture<Void> completion = new CompletableFuture<>();
+        externalTicks.offer(completion);
+        Thread worker = workerThread;
+        if (worker != null) {
+            java.util.concurrent.locks.LockSupport.unpark(worker);
+        }
+        return completion;
+    }
+
     void setTickBody(Runnable tickBody) {
         this.tickBody = java.util.Objects.requireNonNull(tickBody, "tickBody");
     }
 
     private void runTickLoop() {
+        workerThread = Thread.currentThread();
         long nextTickStart = System.nanoTime();
 
         while (!stopRequested.get() && !workers.isShutdown()) {
+            if (externallyDriven.get()) {
+                CompletableFuture<Void> completion = externalTicks.poll();
+                if (completion == null) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+                    continue;
+                }
+
+                try {
+                    runRegionalTick();
+                    completion.complete(null);
+                } catch (Throwable error) {
+                    completion.completeExceptionally(error);
+                }
+                continue;
+            }
+
             nextTickStart += TIME_BETWEEN_TICKS_NANOS;
 
             long remaining;

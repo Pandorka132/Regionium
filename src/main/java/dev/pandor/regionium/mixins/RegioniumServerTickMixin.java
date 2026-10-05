@@ -17,8 +17,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class RegioniumServerTickMixin {
     @Inject(method = "tickChildren", at = @At("HEAD"))
     private void regionium$beginServerTick(CallbackInfo ci) {
-        Regionium.scheduler().beginServerTick();
         MinecraftServer server = (MinecraftServer) (Object) this;
+        Regionium.scheduler().beginServerTick(server);
         for (ServerLevel level : server.getAllLevels()) {
             Regionium.scheduler().registerLevel(level);
             // Refresh the vanilla simulation set before the independent

@@ -33,19 +33,19 @@ import java.util.List;
 @Mixin(CollectingNeighborUpdater.class)
 public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
     @Unique
-    private final ThreadLocal<ArrayDeque<Object>> regionium$stack =
+    private static final ThreadLocal<ArrayDeque<Object>> regionium$stack =
         ThreadLocal.withInitial(ArrayDeque::new);
 
     @Unique
-    private final ThreadLocal<List<Object>> regionium$addedThisLayer =
+    private static final ThreadLocal<List<Object>> regionium$addedThisLayer =
         ThreadLocal.withInitial(ArrayList::new);
 
     @Unique
-    private final ThreadLocal<int[]> regionium$count =
+    private static final ThreadLocal<int[]> regionium$count =
         ThreadLocal.withInitial(() -> new int[1]);
 
     @Unique
-    private final ThreadLocal<int[]> regionium$runDepth =
+    private static final ThreadLocal<int[]> regionium$runDepth =
         ThreadLocal.withInitial(() -> new int[1]);
 
     @Redirect(
