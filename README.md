@@ -1,12 +1,15 @@
 # Regionium
 
 Multithreading in Fabric Minecraft!
-Basically a folia port to fabric with mixins. Work in progress, might not work as intended
+Work in progress, might be really unstable!
+Use at your own risk!
 
 This project uses [Stonecraft](https://stonecraft.meza.gg) to build for Fabric, Forge, and NeoForge. It includes:
 
 
 ## Build and verify
+
+Download it from the [Actions](https://github.com/Pandorka132/Regionium/actions) page, or build it yourself:
 
 Run the available commands from the project root:
 
