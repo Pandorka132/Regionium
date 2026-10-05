@@ -3,6 +3,7 @@ package dev.pandor.regionium.core;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import dev.pandor.regionium.Regionium;
 
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
@@ -80,6 +81,7 @@ public final class RegioniumScheduler implements AutoCloseable {
     private static final AtomicInteger debugActiveWorkers = new AtomicInteger();
     private static final AtomicInteger debugMaxConcurrentWorkers = new AtomicInteger();
     private final AtomicBoolean tickInProgress = new AtomicBoolean();
+    private final AtomicBoolean gameTestDriven = new AtomicBoolean();
 
     public RegioniumScheduler() {
         this(DEFAULT_REGION_COUNT);
@@ -193,13 +195,51 @@ public final class RegioniumScheduler implements AutoCloseable {
      * <p>This counter is diagnostic and provides a batch identifier. It is not
      * a regional clock, barrier, or release mechanism.</p>
      */
-    public void beginServerTick() {
+    public void beginServerTick(MinecraftServer server) {
         synchronized (tickLock) {
             tick++;
             debugTick = tick;
             tickInProgress.set(true);
         }
         drainGlobalPackets();
+    }
+
+    public void setGameTestDriven(boolean enabled) {
+        if (gameTestDriven.compareAndSet(false, enabled) && enabled) {
+            Regionium.LOGGER.info("[GAMETEST] Region scheduler switched to server-tick-driven mode");
+        }
+        for (RegioniumRegion region : regions) {
+            region.setExternallyDriven(enabled);
+        }
+    }
+
+    /**
+     * GameTestServer advances its logical ticks as fast as possible instead of
+     * waiting for wall-clock 20 TPS. In that environment the server tick is
+     * the authoritative simulation clock, so each server tick drives exactly
+     * one regional tick while the actual work still executes on Regionium
+     * workers.
+     */
+    public void driveGameTestRegions() {
+        if (!gameTestDriven.get()) {
+            return;
+        }
+
+        List<java.util.concurrent.Future<?>> futures = new ArrayList<>(regions.size());
+        for (RegioniumRegion region : regions) {
+            futures.add(region.requestExternallyDrivenTick());
+        }
+
+        for (java.util.concurrent.Future<?> future : futures) {
+            try {
+                future.get();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (java.util.concurrent.ExecutionException error) {
+                Regionium.LOGGER.error("GameTest regional tick failed", error.getCause());
+            }
+        }
     }
     public static long currentDebugTick() {
         return debugTick;

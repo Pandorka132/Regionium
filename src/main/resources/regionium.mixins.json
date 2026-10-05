@@ -27,6 +27,7 @@
     "PacketProcessorRegioniumMixin",
     "PacketProcessorListenerAndPacketMixin",
     "RegioniumServerTickMixin",
+    "GameTestServerRegioniumMixin",
     "MinecraftServerRegioniumShutdownMixin",
     "DistanceManagerRegioniumAccessorMixin",
     "SimulationChunkTrackerRegioniumAccessorMixin",
@@ -38,6 +39,7 @@
     "ChunkMapRegioniumVisibleAccessorMixin",
     "LevelChunkRegioniumTickAccessorMixin",
     "CollectingNeighborUpdaterRegioniumAccessorMixin",
+    "CollectingNeighborUpdaterRegioniumConcurrencyMixin",
     "ServerLevelNeighborUpdaterRegioniumMixin",
     "ServerLevelNeighborUpdaterRegioniumAccessorMixin",
     "ServerConnectionListenerRegioniumMixin"

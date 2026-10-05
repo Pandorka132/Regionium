@@ -43,10 +43,12 @@ public final class ExampleGameTests {
             piston, BlockStateProperties.EXTENDED, true));
     }
 
-    @GameTest(maxTicks = 5000)
+    @GameTest(maxTicks = 500)
     public void fallingSand(GameTestHelper helper) {
         BlockPos ground = new BlockPos(2, 1, 2);
         BlockPos sand = new BlockPos(2, 6, 2);
+        BlockPos landing = ground.above();
+        java.util.concurrent.atomic.AtomicBoolean observedFalling = new java.util.concurrent.atomic.AtomicBoolean();
 
         Regionium.scheduler().registerLevel(helper.getLevel());
         Regionium.scheduler().refreshChunkLeases(helper.getLevel());
@@ -56,14 +58,25 @@ public final class ExampleGameTests {
         });
 
         helper.startSequence()
-            .thenIdle(300)
-            .thenExecute(() -> {
+            .thenExecuteFor(20, () -> {
                 var falling = BuiltInRegistries.ENTITY_TYPE.getValue(
                     Identifier.fromNamespaceAndPath("minecraft", "falling_block"));
-                var entities = helper.getEntities(falling);
                 double startY = helper.absolutePos(sand).getY();
-                if (entities.stream().noneMatch(entity -> entity.getY() < startY)) {
-                    throw helper.assertionException("Falling sand entity did not tick downward");
+                if (helper.getEntities(falling, sand, 32.0).stream()
+                    .anyMatch(entity -> entity.getY() < startY)) {
+                    observedFalling.set(true);
+                }
+            })
+            .thenIdle(100)
+            .thenExecute(() -> {
+                if (!observedFalling.get()) {
+                    throw helper.assertionException(
+                        "Falling sand never produced a downward-moving FallingBlockEntity");
+                }
+                if (!helper.getBlockState(landing).is(Blocks.SAND)) {
+                    throw helper.assertionException(
+                        "Falling sand did not convert back into a sand block at "
+                            + helper.absolutePos(landing) + ", state=" + helper.getBlockState(landing));
                 }
             })
             .thenSucceed();
@@ -85,9 +98,9 @@ public final class ExampleGameTests {
             lamp, BlockStateProperties.LIT, false));
     }
 
-    // These sanity tests intentionally bypass Regionium's scheduler. They are
-    // adapted from public Fabric/Create GameTest examples and isolate the
-    // GameTest/vanilla behavior from Regionium's regionized tick pipeline.
+    // These sanity tests exercise the same GameTest world through Regionium's
+    // regionized tick pipeline, while keeping the assertions focused on the
+    // vanilla behavior being validated.
 
     @GameTest(maxTicks = 20)
     public void external_sanity_block(GameTestHelper helper) {
@@ -127,23 +140,40 @@ public final class ExampleGameTests {
             lamp, BlockStateProperties.LIT, false));
     }
 
-    @GameTest(maxTicks = 1000)
+    @GameTest(maxTicks = 500)
     public void external_sanity_falling_block(GameTestHelper helper) {
         BlockPos ground = new BlockPos(2, 1, 2);
         BlockPos sand = new BlockPos(2, 6, 2);
+        BlockPos landing = ground.above();
+        java.util.concurrent.atomic.AtomicBoolean observedFalling = new java.util.concurrent.atomic.AtomicBoolean();
 
-        helper.setBlock(ground, Blocks.STONE);
-        helper.setBlock(sand, Blocks.SAND);
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+        Regionium.scheduler().execute(helper.getLevel(), helper.absolutePos(sand), () -> {
+            helper.setBlock(ground, Blocks.STONE);
+            helper.setBlock(sand, Blocks.SAND);
+        });
 
         helper.startSequence()
-            .thenIdle(300)
-            .thenExecute(() -> {
+            .thenExecuteFor(20, () -> {
                 var falling = BuiltInRegistries.ENTITY_TYPE.getValue(
                     Identifier.fromNamespaceAndPath("minecraft", "falling_block"));
-                var entities = helper.getEntities(falling);
                 double startY = helper.absolutePos(sand).getY();
-                if (entities.stream().noneMatch(entity -> entity.getY() < startY)) {
-                    throw helper.assertionException("Falling sand entity did not tick downward");
+                if (helper.getEntities(falling, sand, 32.0).stream()
+                    .anyMatch(entity -> entity.getY() < startY)) {
+                    observedFalling.set(true);
+                }
+            })
+            .thenIdle(100)
+            .thenExecute(() -> {
+                if (!observedFalling.get()) {
+                    throw helper.assertionException(
+                        "Falling sand never produced a downward-moving FallingBlockEntity");
+                }
+                if (!helper.getBlockState(landing).is(Blocks.SAND)) {
+                    throw helper.assertionException(
+                        "Falling sand did not convert back into a sand block at "
+                            + helper.absolutePos(landing) + ", state=" + helper.getBlockState(landing));
                 }
             })
             .thenSucceed();
