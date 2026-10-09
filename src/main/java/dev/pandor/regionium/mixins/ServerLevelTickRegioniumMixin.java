@@ -18,9 +18,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
+import java.util.function.BiConsumer;
 
 @Mixin(ServerLevel.class)
 public abstract class ServerLevelTickRegioniumMixin {
+    private static final ThreadLocal<Boolean> REGIONIUM$DIRECT_TICKS = ThreadLocal.withInitial(() -> false);
 
     /*
      * ServerLevel.tick() is intentionally allowed to execute on the global
@@ -236,28 +239,58 @@ public abstract class ServerLevelTickRegioniumMixin {
         }
     }
 
-    /*
-     * LevelTicks is shared world state. The region tick owns the callback,
-     * but the global maintenance pass must never consume the same queue.
-     */
     @Redirect(
         method = "tick",
         at = @At(
             value = "INVOKE",
-            target = "Lnet/minecraft/world/ticks/LevelTicks;tick(JILjava/util/function/BiConsumer;)V"
+            target = "Lnet/minecraft/world/ticks/LevelTicks;tick(JILjava/util/function/BiConsumer;)V",
+            ordinal = 0
         )
     )
-    private void regionium$regionLocalScheduledTicks(
+    private void regionium$blockTicks(
         LevelTicks<?> ticks,
         long gameTime,
         int maxTicks,
         BiConsumer callback
     ) {
-        ServerLevel level = (ServerLevel) (Object) this;
-
-        if (!RegioniumContext.isRegionThread()) {
+        if (!RegioniumContext.isRegionThread() || REGIONIUM$DIRECT_TICKS.get()) {
+            ticks.tick(gameTime, maxTicks, callback);
             return;
         }
-        Regionium.scheduler().tickScheduledTicksRegionally(level, ticks, maxTicks, callback);
+        ServerLevel level = (ServerLevel) (Object) this;
+        try {
+            REGIONIUM$DIRECT_TICKS.set(true);
+            Regionium.scheduler().tickScheduledTicksRegionally(level, ticks, maxTicks, callback);
+        } finally {
+            REGIONIUM$DIRECT_TICKS.set(false);
+        }
     }
+
+    @Redirect(
+        method = "tick",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/world/ticks/LevelTicks;tick(JILjava/util/function/BiConsumer;)V",
+            ordinal = 1
+        )
+    )
+    private void regionium$fluidTicks(
+        LevelTicks<?> ticks,
+        long gameTime,
+        int maxTicks,
+        BiConsumer callback
+    ) {
+        if (!RegioniumContext.isRegionThread() || REGIONIUM$DIRECT_TICKS.get()) {
+            ticks.tick(gameTime, maxTicks, callback);
+            return;
+        }
+        ServerLevel level = (ServerLevel) (Object) this;
+        try {
+            REGIONIUM$DIRECT_TICKS.set(true);
+            Regionium.scheduler().tickScheduledTicksRegionally(level, ticks, maxTicks, callback);
+        } finally {
+            REGIONIUM$DIRECT_TICKS.set(false);
+        }
+    }
+
 }

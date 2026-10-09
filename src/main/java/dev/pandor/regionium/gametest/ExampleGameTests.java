@@ -123,8 +123,12 @@ public final class ExampleGameTests {
         BlockPos piston = new BlockPos(2, 1, 2);
         BlockPos power = piston.relative(Direction.WEST);
 
-        helper.setBlock(piston, Blocks.PISTON, Direction.EAST);
-        helper.setBlock(power, Blocks.REDSTONE_BLOCK);
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+        Regionium.scheduler().execute(helper.getLevel(), helper.absolutePos(piston), () -> {
+            helper.setBlock(piston, Blocks.PISTON, Direction.EAST);
+            helper.setBlock(power, Blocks.REDSTONE_BLOCK);
+        });
 
         helper.succeedWhen(() -> helper.assertBlockProperty(
             piston, BlockStateProperties.EXTENDED, true));

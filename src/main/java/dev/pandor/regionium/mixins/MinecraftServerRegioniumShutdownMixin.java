@@ -15,8 +15,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class MinecraftServerRegioniumShutdownMixin {
     @Inject(method = "stopServer", at = @At("HEAD"))
     private void regionium$haltRegionsBeforeShutdown(CallbackInfo ci) {
-        Regionium.LOGGER.info("[Regionium] Halting region scheduler before server shutdown");
+        Regionium.LOGGER.trace("[Regionium] Halting region scheduler before server shutdown");
         Regionium.scheduler().close();
-        Regionium.LOGGER.info("[Regionium] Region scheduler halted");
+        Regionium.LOGGER.trace("[Regionium] Region scheduler halted");
     }
 }

@@ -71,7 +71,7 @@ jobs:
 
       - name: "🧪 Run Dev Build"
         if: ${{ steps.get-next-version.outputs.new_release_published != 'true' }}
-        run: ./gradlew runGameTestServer buildAndCollect --stacktrace
+        run: ./gradlew runGameTestServer buildAndCollect -Pregionium.carpetTests --stacktrace
 
       - name: "🏗️ Build, Test & Release"
         if: ${{ steps.get-next-version.outputs.new_release_published == 'true' }}
@@ -99,4 +99,4 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Artifacts
-          path: versions/*/build/libs/*
+          path: build/libs/*

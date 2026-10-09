@@ -14,9 +14,16 @@ public abstract class ServerLevelEntityLifecycleRegioniumMixin {
     private void regionium$registerFreshEntity(
         Entity entity, CallbackInfoReturnable<Boolean> cir
     ) {
-        // Entity creation is a server-thread lifecycle boundary. Register the
-        // entity with its current chunk owner here as well as from region-owned
-        // lifecycle paths; GameTestServer creates test entities on the server thread.
-        Regionium.scheduler().trackEntity(entity);
+        /*
+         * ServerPlayer has a distinct lifecycle boundary: addFreshEntity()
+         * happens before PlayerList.placeNewPlayer() has installed the PLAY
+         * connection. Folia only puts the player into the active region's
+         * local player/connection state once the gameplay session exists.
+         * Register ordinary entities here, but let PlayerList's PLAY lifecycle
+         * hook register ServerPlayer.
+         */
+        if (!(entity instanceof net.minecraft.server.level.ServerPlayer)) {
+            Regionium.scheduler().trackEntity(entity);
+        }
     }
 }

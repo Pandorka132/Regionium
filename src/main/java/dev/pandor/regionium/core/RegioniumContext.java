@@ -1,4 +1,3 @@
-
 package dev.pandor.regionium.core;
 
 import org.jetbrains.annotations.Nullable;
@@ -6,39 +5,40 @@ import org.jetbrains.annotations.Nullable;
 import java.util.Objects;
 
 /**
- * Describes which Regionium execution context the current thread is in.
+ * Execution context of the currently ticking region.
  *
- * <p>Regionium deliberately uses ownership instead of making the entire
- * Minecraft object graph thread-safe. A region-owned object may only be
- * mutated by its owning region during a tick.</p>
+ * RegionizedWorldData is derived from the current region; it is not a second
+ * global map keyed by region.
  */
 public final class RegioniumContext {
     private static final ThreadLocal<RegioniumRegion> CURRENT_REGION = new ThreadLocal<>();
-    private static final ThreadLocal<RegioniumWorldData> CURRENT_WORLD_DATA = new ThreadLocal<>();
 
     private RegioniumContext() {
     }
 
     public static void enter(RegioniumRegion region) {
         CURRENT_REGION.set(Objects.requireNonNull(region, "region"));
-        CURRENT_WORLD_DATA.remove();
     }
 
     public static void enterWorld(RegioniumWorldData data) {
-        CURRENT_WORLD_DATA.set(Objects.requireNonNull(data, "data"));
+        RegioniumRegion current = requireRegionThread();
+        if (current.worldData() != data) {
+            throw new IllegalStateException("World data does not belong to current region");
+        }
     }
 
     public static void exitWorld() {
-        CURRENT_WORLD_DATA.remove();
+        // World data is derived from the current region. There is no second
+        // ThreadLocal world-data state to clear.
     }
 
     public static void exit() {
-        CURRENT_WORLD_DATA.remove();
         CURRENT_REGION.remove();
     }
 
     public static @Nullable RegioniumWorldData currentWorldData() {
-        return CURRENT_WORLD_DATA.get();
+        RegioniumRegion region = CURRENT_REGION.get();
+        return region == null ? null : region.worldData();
     }
 
     public static @Nullable RegioniumRegion currentRegion() {
@@ -52,28 +52,21 @@ public final class RegioniumContext {
     public static RegioniumRegion requireRegionThread() {
         RegioniumRegion region = CURRENT_REGION.get();
         if (region == null) {
-            throw new IllegalStateException("This operation requires a Regionium region thread");
+            throw new IllegalStateException(
+                "This operation requires a Regionium region context"
+            );
         }
         return region;
     }
 
-    /**
-     * Verifies that the current worker is the execution owner of an object.
-     *
-     * <p>This is intended for debug guards around Minecraft operations that
-     * must never be performed by another region.</p>
-     */
-    public static void requireOwner(RegioniumOwnership ownership, Object object) {
-        Objects.requireNonNull(ownership, "ownership");
-        Objects.requireNonNull(object, "object");
-
+    public static void requireOwner(Object object) {
         RegioniumRegion current = requireRegionThread();
-        if (!ownership.isOwnedBy(object, current)) {
-            RegioniumRegion owner = ownership.ownerOf(object);
+        RegioniumRegion owner = dev.pandor.regionium.Regionium.scheduler().ownerOf(object);
+        if (owner != current) {
             throw new IllegalStateException(
-                "Illegal cross-region access: current=" + current
-                    + ", owner=" + owner
-                    + ", object=" + object
+                "Illegal cross-region access: current=" + current +
+                    ", owner=" + owner +
+                    ", object=" + object
             );
         }
     }

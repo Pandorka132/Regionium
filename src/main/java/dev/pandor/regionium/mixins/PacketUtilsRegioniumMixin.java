@@ -81,7 +81,7 @@ public abstract class PacketUtilsRegioniumMixin {
         }
 
         if (listener instanceof ServerGamePacketListenerImpl game) {
-            Regionium.LOGGER.info(
+            Regionium.LOGGER.trace(
                 "[PACKET-IN] player={} packet={} owner={} current={} thread={}",
                 game.player.getGameProfile().name(),
                 packet.getClass().getSimpleName(),

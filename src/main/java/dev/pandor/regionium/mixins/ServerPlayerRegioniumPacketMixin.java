@@ -1,7 +1,6 @@
 package dev.pandor.regionium.mixins;
 
 import dev.pandor.regionium.Regionium;
-import dev.pandor.regionium.access.PacketProcessorRegioniumAccess;
 import dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess;
 import dev.pandor.regionium.core.RegioniumWorldData;
 import net.minecraft.network.PacketListener;
@@ -23,7 +22,8 @@ public abstract class ServerPlayerRegioniumPacketMixin implements ServerPlayerRe
     @Override
     public void regionium$updateRegion(RegioniumWorldData region) {
         regionium$lastRegion = region;
-        if (region != null && ((dev.pandor.regionium.access.PacketProcessorRegioniumAccess) regionium$packetProcessor).regionium$hasPackets()) {
+        if (region != null && ((dev.pandor.regionium.access.PacketProcessorRegioniumAccess)
+            (Object) regionium$packetProcessor).regionium$hasPackets()) {
             Regionium.scheduler().notifyRegionPackets(region);
         }
     }
@@ -31,9 +31,10 @@ public abstract class ServerPlayerRegioniumPacketMixin implements ServerPlayerRe
     @Override
     public <T extends PacketListener> void regionium$schedulePacket(T listener, Packet<T> packet) {
         regionium$packetProcessor.scheduleIfPossible(listener, packet);
-        boolean queued = ((PacketProcessorRegioniumAccess) regionium$packetProcessor).regionium$hasPackets();
+        boolean queued = ((dev.pandor.regionium.access.PacketProcessorRegioniumAccess)
+            (Object) regionium$packetProcessor).regionium$hasPackets();
         RegioniumWorldData region = regionium$lastRegion;
-        Regionium.LOGGER.info(
+        Regionium.LOGGER.trace(
             "[PACKET-QUEUE] player={} packet={} scheduled={} region={} thread={}",
             ((ServerPlayer) (Object) this).getGameProfile().name(),
             packet.getClass().getSimpleName(),

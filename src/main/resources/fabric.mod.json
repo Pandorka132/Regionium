@@ -21,7 +21,8 @@
       "${group}.${id}.datagen.fabric.ExampleDataGenerator"
     ],
     "fabric-gametest": [
-      "${group}.${id}.gametest.ExampleGameTests"
+      "${group}.${id}.gametest.ExampleGameTests",
+      "${group}.${id}.gametest.CarpetPlayerGameTests"
     ]
   },
   "mixins": [

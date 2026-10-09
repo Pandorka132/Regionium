@@ -12,11 +12,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import java.util.function.Consumer;
 
 /**
- * Filters vanilla ServerLevel entity ticking by the current region.
- *
- * ServerLevel.tick() is now executed directly by a Regionium region clock,
- * so the entity phase must stay synchronous with that tick rather than
- * enqueueing another mailbox task.
+ * Filters vanilla ServerLevel entity ticking by spatial region ownership.
  */
 @Mixin(ServerLevel.class)
 public abstract class ServerLevelEntityTickRegioniumMixin {
@@ -35,21 +31,53 @@ public abstract class ServerLevelEntityTickRegioniumMixin {
         var current = RegioniumContext.currentRegion();
 
         if (current == null) {
-            // Entity execution belongs to region-local world data. The global
-            // ServerLevel maintenance pass must never tick the shared list.
             return;
         }
 
-        // Folia-style: the region tick iterates its region-local entity index,
-        // never the shared vanilla EntityTickList.
-        for (Entity entity : Regionium.scheduler().entitiesForCurrentRegion(level).toArray(Entity[]::new)) {
+        for (Entity entity : Regionium.scheduler()
+            .entitiesForCurrentRegion(level)
+            .toArray(Entity[]::new)) {
             if (entity == null || entity.isRemoved()) {
                 continue;
             }
-            if (Regionium.scheduler().chunkLeases().owner(level, entity.chunkPosition().pack()) != current) {
-                Regionium.scheduler().refreshEntityRegion(entity);
+
+            /*
+             * Spatial chunk ownership is authoritative during transfer. A
+             * player can already have moved to the destination chunk while
+             * still being present in the old region's local entity set until
+             * the post-tick migration completes.
+             */
+            if (Regionium.scheduler().regionizer()
+                .owner(level, entity.chunkPosition().pack()) != current) {
                 continue;
             }
+
+            // Folia only ticks entities whose chunk is in the region's
+            // entity-ticking set. Regionium previously ticked every entity
+            // belonging to the region, even when its ChunkHolder had not
+            // reached ENTITY_TICKING/FULL yet.
+            var holder = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+                (Object) level.getChunkSource().chunkMap)
+                .regionium$getVisibleChunkMap()
+                .get(entity.chunkPosition().pack());
+            if (holder == null
+                || holder.getEntityTickingChunkFuture()
+                    .getNow(net.minecraft.server.level.ChunkHolder.UNLOADED_LEVEL_CHUNK)
+                    .orElse(null) == null) {
+                continue;
+            }
+
+            if (entity instanceof net.minecraft.server.level.ServerPlayer player) {
+                // A disconnect can clear the connection before the entity is
+                // removed from the region-owned entity set. Vanilla
+                // ServerPlayer.tick assumes a live connection, so lifecycle
+                // ownership must exclude the player for that tick.
+                if (player.connection == null
+                    || !Regionium.scheduler().arePlayerPhysicsChunksReady(level, player)) {
+                    continue;
+                }
+            }
+
             vanillaTick.accept(entity);
         }
     }

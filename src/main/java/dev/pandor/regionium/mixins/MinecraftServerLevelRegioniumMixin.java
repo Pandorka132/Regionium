@@ -9,7 +9,13 @@ import org.spongepowered.asm.mixin.injection.At;
 
 import java.util.function.BooleanSupplier;
 
-/** Maintains the per-level chunk ownership snapshot around the vanilla level tick. */
+/**
+ * Removes the vanilla global ServerLevel simulation tick.
+ *
+ * Folia has no second global world tick: region schedulers own the complete
+ * world simulation. The global server thread only performs chunk lifecycle
+ * and other genuinely global maintenance.
+ */
 @Mixin(net.minecraft.server.MinecraftServer.class)
 public abstract class MinecraftServerLevelRegioniumMixin {
     @WrapOperation(
@@ -24,10 +30,25 @@ public abstract class MinecraftServerLevelRegioniumMixin {
         BooleanSupplier haveTime,
         Operation<Void> original
     ) {
+        // Global world time is advanced once here, exactly like Folia's
+        // global-region tick. The region-local ServerLevel.tickTime() only
+        // advances its redstone clock.
+        Regionium.scheduler().tickGlobalTime(level);
+
+        // Folia's global region processes chunk lifecycle/ticket work even
+        // when no simulation region is active yet. This is what allows
+        // GameTest structures and newly requested chunks to become ticking
+        // chunks before the owning region can execute them.
+        level.getChunkSource().tick(haveTime, false);
+
+        Regionium.scheduler().regionizer().markTopologyDirty(level);
+        ((ServerLevelEntityManagerAccessorMixin) (Object) level)
+            .regionium$getEntityManager().tick();
         Regionium.scheduler().prepareChunkExecution(level);
-        // ServerLevel.tick() now releases its regional tick plans asynchronously
-        // at its own TAIL. Do not refresh leases here after the tick: that would
-        // inspect/mutate lease state while region workers are still executing.
-        original.call(level, haveTime);
+        // Intentionally do not call original.call().
+        //
+        // RegioniumRegion.tickRegion() invokes ServerLevel.tick() from the
+        // owning region context. Calling it here as well would create a
+        // second simulation pass and would reintroduce shared-state races.
     }
 }
