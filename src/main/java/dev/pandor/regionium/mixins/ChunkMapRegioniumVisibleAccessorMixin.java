@@ -10,4 +10,7 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 public interface ChunkMapRegioniumVisibleAccessorMixin {
     @Accessor("visibleChunkMap")
     Long2ObjectLinkedOpenHashMap<ChunkHolder> regionium$getVisibleChunkMap();
+
+    @Accessor("level")
+    net.minecraft.server.level.ServerLevel regionium$getLevel();
 }

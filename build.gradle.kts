@@ -4,6 +4,26 @@ plugins {
     id("gg.meza.stonecraft")
 }
 
+if (providers.gradleProperty("regionium.carpetTests").isPresent && mod.isFabric) {
+    repositories {
+        exclusiveContent {
+            forRepository {
+                maven {
+                    name = "Modrinth"
+                    url = uri("https://api.modrinth.com/maven")
+                }
+            }
+            filter {
+                includeGroup("maven.modrinth")
+            }
+        }
+    }
+
+    dependencies {
+        runtimeOnly("maven.modrinth:TQTTVgYE:yt9oDFOj")
+    }
+}
+
 modSettings {
     clientOptions {
         fov = 90

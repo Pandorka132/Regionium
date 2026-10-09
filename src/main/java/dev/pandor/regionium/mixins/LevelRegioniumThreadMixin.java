@@ -46,7 +46,7 @@ public abstract class LevelRegioniumThreadMixin {
     ) {
         ChunkAccess chunk = original.call(level, x, z, status);
         if (chunk instanceof ImposterProtoChunk imposter) {
-            Regionium.LOGGER.debug("[MT] unwrapping ImposterProtoChunk at [{}, {}] on {}", x, z, Thread.currentThread().getName());
+            Regionium.LOGGER.trace("[MT] unwrapping ImposterProtoChunk at [{}, {}] on {}", x, z, Thread.currentThread().getName());
             return imposter.getWrapped();
         }
         return chunk;
@@ -69,7 +69,8 @@ public abstract class LevelRegioniumThreadMixin {
             return;
         }
 
-        level.getServer().execute(() -> level.addBlockEntityTicker(ticker));
+        var region = RegioniumContext.requireRegionThread();
+        Regionium.scheduler().worldData(level).addBlockEntityTicker(ticker);
         ci.cancel();
     }
 }

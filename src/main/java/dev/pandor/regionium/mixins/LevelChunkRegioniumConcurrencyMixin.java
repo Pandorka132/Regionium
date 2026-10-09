@@ -39,4 +39,55 @@ public abstract class LevelChunkRegioniumConcurrencyMixin {
             return original.call(pos, state, flags);
         }
     }
+
+    @WrapMethod(method = "getBlockEntity")
+    private net.minecraft.world.level.block.entity.BlockEntity regionium$lockedBlockEntityRead(
+        BlockPos pos,
+        Operation<net.minecraft.world.level.block.entity.BlockEntity> original
+    ) {
+        synchronized (this) {
+            return original.call(pos);
+        }
+    }
+
+    @WrapMethod(method = "getBlockEntity(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/chunk/LevelChunk$EntityCreationType;)Lnet/minecraft/world/level/block/entity/BlockEntity;")
+    private net.minecraft.world.level.block.entity.BlockEntity regionium$lockedBlockEntityReadWithType(
+        BlockPos pos,
+        net.minecraft.world.level.chunk.LevelChunk.EntityCreationType creationType,
+        Operation<net.minecraft.world.level.block.entity.BlockEntity> original
+    ) {
+        synchronized (this) {
+            return original.call(pos, creationType);
+        }
+    }
+
+    @WrapMethod(method = "addAndRegisterBlockEntity")
+    private void regionium$lockedBlockEntityAdd(
+        net.minecraft.world.level.block.entity.BlockEntity blockEntity,
+        Operation<Void> original
+    ) {
+        synchronized (this) {
+            original.call(blockEntity);
+        }
+    }
+
+    @WrapMethod(method = "setBlockEntity")
+    private void regionium$lockedBlockEntitySet(
+        net.minecraft.world.level.block.entity.BlockEntity blockEntity,
+        Operation<Void> original
+    ) {
+        synchronized (this) {
+            original.call(blockEntity);
+        }
+    }
+
+    @WrapMethod(method = "removeBlockEntity")
+    private void regionium$lockedBlockEntityRemove(
+        BlockPos pos,
+        Operation<Void> original
+    ) {
+        synchronized (this) {
+            original.call(pos);
+        }
+    }
 }

@@ -1,7 +1,6 @@
 package dev.pandor.regionium;
 
 import com.mojang.brigadier.CommandDispatcher;
-import com.mojang.brigadier.arguments.IntegerArgumentType;
 import dev.pandor.regionium.core.RegioniumScheduler;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -25,13 +24,13 @@ public final class Regionium implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        LOGGER.info(
-            "Regionium initialized with {} execution regions",
-            SCHEDULER.regions().size()
+        LOGGER.trace(
+            "Regionium initialized with {} worker capacity",
+            SCHEDULER.workerCount()
         );
 
-        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
-            registerCommands(dispatcher)
+        CommandRegistrationCallback.EVENT.register(
+            (dispatcher, registryAccess, environment) -> registerCommands(dispatcher)
         );
     }
 
@@ -42,75 +41,56 @@ public final class Regionium implements ModInitializer {
                     MinecraftServer server = context.getSource().getServer();
 
                     context.getSource().sendSuccess(
-                        () -> Component.literal("Regionium threads: " + SCHEDULER.regions().size()),
+                        () -> Component.literal(
+                            "Active spatial regions: " + SCHEDULER.regions().size()
+                        ),
                         false
                     );
 
-                    for (var region : SCHEDULER.regions()) {
-                        var players = server.getPlayerList().getPlayers().stream()
-                            .filter(player -> SCHEDULER.ownerOf(player) == region)
-                            .toList();
+                    context.getSource().sendSuccess(
+                        () -> Component.literal(
+                            "Scheduler workers: " + SCHEDULER.workerCount()
+                        ),
+                        false
+                    );
 
-                        if (!players.isEmpty()) {
-                            String names = players.stream()
-                                .map(ServerPlayer::getGameProfile)
-                                .map(profile -> profile.name())
-                                .reduce((a, b) -> a + ", " + b)
-                                .orElse("");
-
-                            String playerWord = players.size() == 1 ? "player" : "players";
+                    ServerPlayer sourcePlayer = context.getSource().getPlayer();
+                    if (sourcePlayer != null) {
+                        var owner = SCHEDULER.ownerOf(sourcePlayer);
+                        if (owner != null) {
                             context.getSource().sendSuccess(
                                 () -> Component.literal(
-                                    region.workerName()
-                                        + " - "
-                                        + players.size()
-                                        + " "
-                                        + playerWord
-                                        + ": "
-                                        + names
+                                    "Current region: " + owner.id() +
+                                        " (last scheduler thread: " + owner.lastWorkerThreadName() +
+                                        ", ticking=" + owner.isTicking() + ")"
                                 ),
                                 false
                             );
                         }
                     }
 
+                    for (var region : SCHEDULER.regions()) {
+                        int players = region.worldData().players().size();
+                        int entities = region.worldData().entities().size();
+                        int chunks = region.worldData().chunks().size();
+
+                        if (players == 0 && entities == 0 && chunks == 0) {
+                            continue;
+                        }
+
+                        context.getSource().sendSuccess(
+                            () -> Component.literal(
+                                "Region " + region.id() +
+                                    " - chunks=" + chunks +
+                                    ", entities=" + entities +
+                                    ", players=" + players
+                            ),
+                            false
+                        );
+                    }
+
                     return 1;
                 })
-                .then(
-                    Commands.literal("transfer")
-                        .then(
-                            Commands.argument("id", IntegerArgumentType.integer(0, SCHEDULER.regions().size() - 1))
-                                .executes(context -> {
-                                    ServerPlayer player = context.getSource().getPlayerOrException();
-                                    int destinationId = IntegerArgumentType.getInteger(context, "id");
-                                    var destination = SCHEDULER.region(destinationId);
-
-                                    /*
-                                     * The player and its ServerLevel are one execution unit.
-                                     * Moving only the player would make packet handlers run on
-                                     * the destination worker while the world keeps ticking on
-                                     * the source worker.
-                                     */
-                                    // ServerLevel is shared state in the regionized architecture;
-                                    // only the player's execution ownership is migrated here.
-                                    // The destination region must already be a valid region of this scheduler.
-                                    SCHEDULER.requestTransfer(player, destination);
-                                    SCHEDULER.applyPendingTransfers();
-
-                                    context.getSource().sendSuccess(
-                                        () -> Component.literal(
-                                            "Transferred to Region "
-                                                + destinationId
-                                                + " ("
-                                                + destination.workerName()
-                                                + ")"
-                                        ),
-                                        false
-                                    );
-                                    return 1;
-                                })
-                        )
-                )
         );
     }
 }

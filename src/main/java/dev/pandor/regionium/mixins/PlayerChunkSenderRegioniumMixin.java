@@ -40,7 +40,7 @@ public abstract class PlayerChunkSenderRegioniumMixin {
             return;
         }
 
-        var owner = Regionium.scheduler().chunkLeases()
+        var owner = Regionium.scheduler().regionizer()
             .owner(level, chunk.getPos().pack());
 
         if (owner == null) {
@@ -62,7 +62,7 @@ public abstract class PlayerChunkSenderRegioniumMixin {
             ));
 
             if (net.minecraft.SharedConstants.DEBUG_VERBOSE_SERVER_EVENTS) {
-                Regionium.LOGGER.debug("SEN {}", chunk.getPos());
+                Regionium.LOGGER.trace("SEN {}", chunk.getPos());
             }
 
             level.debugSynchronizers().startTrackingChunk(

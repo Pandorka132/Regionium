@@ -16,7 +16,7 @@ public abstract class PlayerTickDebugMixin {
     @Inject(method = "tick", at = @At("HEAD"))
     private void regionium$debugTickThread(CallbackInfo ci) {
         if (++regionium$debugTickCounter % 20 == 0) {
-            Regionium.LOGGER.info(
+            Regionium.LOGGER.trace(
                 "PLAYER TICK DEBUG: thread={}, regionThread={}",
                 Thread.currentThread().getName(),
                 Thread.currentThread().getName().startsWith("Regionium-Worker-")

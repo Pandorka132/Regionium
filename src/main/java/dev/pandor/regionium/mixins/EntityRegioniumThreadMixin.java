@@ -2,6 +2,7 @@ package dev.pandor.regionium.mixins;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
@@ -27,14 +28,34 @@ public abstract class EntityRegioniumThreadMixin {
         if (!RegioniumContext.isRegionThread()
             || !(self.level() instanceof ServerLevel level)) {
             original.call(callback);
+
+            /*
+             * Server-thread teleports are the safe synchronous transfer
+             * boundary. The vanilla callback has already updated its global
+             * entity-section index, so Regionium can now atomically move the
+             * entity to the region owning its new chunk before any region tick
+             * can observe the new position.
+             */
+            Regionium.scheduler().refreshEntityRegion(self);
+            if (self instanceof net.minecraft.server.level.ServerPlayer player) {
+                Regionium.scheduler().queueGlobalPlayerMove(player);
+            }
             return;
         }
 
-        // Entity callbacks are region-owned in Folia's model. Do not bounce
-        // them through the global server executor: that reintroduces a global
-        // entity-management thread and creates stale tracking windows.
-        original.call(callback);
-        dev.pandor.regionium.Regionium.scheduler().refreshEntityRegion(self);
+        // PersistentEntitySectionManager is a global vanilla index. Its
+        // EntitySectionStorage contains mutable AVL trees and cannot be
+        // modified concurrently by independent region workers.
+        //
+        // Folia replaces that global lookup with a region-owned entity lookup.
+        // Regionium's equivalent source of truth is RegioniumWorldData, so the
+        // global onMove callback must not run from a region thread. Entity
+        // ownership is reconciled from spatial chunk ownership after the
+        // current region tick.
+        //
+        // Do not call original here: doing so writes the global
+        // EntitySectionStorage from the region worker and races other regions.
+        return;
     }
 
     @WrapOperation(

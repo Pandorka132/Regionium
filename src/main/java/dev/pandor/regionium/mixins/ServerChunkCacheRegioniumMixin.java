@@ -15,6 +15,8 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.util.List;
+
 @Mixin(ServerChunkCache.class)
 public abstract class ServerChunkCacheRegioniumMixin {
     @Shadow private ServerLevel level;
@@ -85,18 +87,49 @@ public abstract class ServerChunkCacheRegioniumMixin {
                 net.minecraft.world.level.gamerules.GameRules.RANDOM_TICK_SPEED
             );
 
-            chunkMap.forEachBlockTickingChunk(chunk -> {
+            for (var chunk : List.copyOf(current.worldData().entityTickingChunks())) {
                 long packed = chunk.getPos().pack();
-                if (Regionium.scheduler().chunkLeases().owner(level, packed) == current) {
-                    Regionium.scheduler().beginChunkExecution(level, packed);
-                    try {
-                        level.tickChunk(chunk, tickSpeed);
-                    } finally {
-                        Regionium.scheduler().endChunkExecution(level, packed);
-                    }
+                if (Regionium.scheduler().regionizer().owner(level, packed) != current) {
+                    continue;
                 }
-            });
+
+                Regionium.scheduler().beginChunkExecution(level, packed);
+                try {
+                    level.tickChunk(chunk, tickSpeed);
+                } finally {
+                    Regionium.scheduler().endChunkExecution(level, packed);
+                }
+            }
         }
+
+        ((dev.pandor.regionium.access.ChunkMapRegioniumTrackingAccess) (Object) chunkMap)
+            .regionium$tickRegionEntities(current.worldData());
+
+        // Folia's ChunkMap tracker tick is part of the region tick. The
+        // global ServerChunkCache maintenance pass must not run it, because
+        // entity tracking state belongs to the ticking region.
+        /*
+         * Vanilla ChunkMap.tick() iterates the global entity tracker. That
+         * tracker is not region-local yet, so executing it from a worker would
+         * race the other regions. Region-local tracker ticking is a separate
+         * lifecycle and must be implemented before this call is restored.
+         */
+
+        /*
+         * This is the region-local equivalent of Folia's
+         * ServerChunkCache.broadcastChangedChunks(). Block changes are queued
+         * by blockChanged(), but the vanilla global ServerChunkCache queue is
+         * not touched on a region thread. The owning region must flush its own
+         * ChunkHolder update set here, otherwise block state changes are made
+         * on the server but never sent to clients.
+         */
+        for (var holder : List.copyOf(current.worldData().chunkHoldersToBroadcast())) {
+            var chunk = holder.getTickingChunk();
+            if (chunk != null) {
+                holder.broadcastChanges(chunk);
+            }
+        }
+        current.worldData().chunkHoldersToBroadcast().clear();
 
         ci.cancel();
     }
