@@ -50,9 +50,9 @@ modSettings {
 
 publishMods {
     type = ALPHA
-    changelog = providers.fileContents(
-        layout.projectDirectory.file("CHANGELOG.md")
-    ).asText
+    changelog = providers.provider {
+        rootProject.file("CHANGELOG.md").readText()
+    }
 
     modrinth {
         accessToken.set(providers.gradleProperty("MODRINTH_TOKEN"))
