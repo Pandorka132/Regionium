@@ -82,7 +82,7 @@ publishMods {
 
     modrinth {
         if (mod.isFabric) requires("fabric-api")
-        environment.set(CLIENT_OR_SERVER_PREFERS_BOTH)
+        environment.set(DEDICATED_SERVER_ONLY)
     }
 
     curseforge {
