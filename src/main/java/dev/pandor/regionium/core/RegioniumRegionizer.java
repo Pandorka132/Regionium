@@ -242,8 +242,11 @@ public final class RegioniumRegionizer {
                 region.stopScheduledTickLoop();
                 migrateRegionState(region, null, Set.of());
             }
-            state.chunkOwners.clear();
-            state.active.clear();
+            // Publish complete ownership snapshots. Mutating a shared map
+            // with clear()/putAll() exposes a transient ownerless world to
+            // region workers performing optimistic reads.
+            state.chunkOwners = Map.of();
+            state.active = Set.of();
             return;
         }
 
@@ -319,11 +322,10 @@ public final class RegioniumRegionizer {
             LevelChunk chunk = holder == null ? null : holder.getTickingChunk();
         }
 
-        state.chunkOwners.clear();
-        state.chunkOwners.putAll(nextOwners);
-
-        state.active.clear();
-        state.active.addAll(used);
+        // Publish atomically: readers see either the old topology or the new
+        // topology, never the empty/partially copied map.
+        state.chunkOwners = Map.copyOf(nextOwners);
+        state.active = Set.copyOf(used);
 
         // Match Folia's RegionCallbacks.onRegionActive/onRegionInactive: a
         // region is scheduled only after the regionizer has established its
@@ -826,15 +828,14 @@ public final class RegioniumRegionizer {
     private static final class LevelState {
         private final ServerLevel level;
         private final List<RegioniumRegion> regions = new ArrayList<>();
-        private final Map<Long, RegioniumRegion> chunkOwners = new ConcurrentHashMap<>();
+        private volatile Map<Long, RegioniumRegion> chunkOwners = Map.of();
         private final Map<Long, ChunkHolder> chunkHolders = new ConcurrentHashMap<>();
         /** Persistent region topology: one owner for every existing holder. */
         private final Set<Long> regionChunks = new LinkedHashSet<>();
         /** Simulation state only; does not determine region ownership. */
         private final Set<Long> leasedChunks = new LinkedHashSet<>();
-        private boolean topologyDirty = true;
-        private final Set<RegioniumRegion> active =
-            Collections.newSetFromMap(new IdentityHashMap<>());
+        private volatile boolean topologyDirty = true;
+        private volatile Set<RegioniumRegion> active = Set.of();
 
         private LevelState(ServerLevel level) {
             this.level = level;
