@@ -78,6 +78,8 @@ publishMods {
 */
 
 publishMods {
+    type = ALPHA
+
     modrinth {
         if (mod.isFabric) requires("fabric-api")
         environment.set(CLIENT_OR_SERVER_PREFERS_BOTH)
