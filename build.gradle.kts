@@ -48,6 +48,7 @@ modSettings {
         )
 }
 
+/*
 publishMods {
     type = ALPHA
     changelog = providers.provider {
@@ -70,6 +71,20 @@ publishMods {
         projectSlug.set(providers.environmentVariable("CURSEFORGE_SLUG"))
         accessToken.set(providers.environmentVariable("CURSEFORGE_TOKEN"))
         client = false
+        server = true
+        if (mod.isFabric) requires("fabric-api")
+    }
+}
+*/
+
+publishMods {
+    modrinth {
+        if (mod.isFabric) requires("fabric-api")
+        environment.set(CLIENT_OR_SERVER_PREFERS_BOTH)
+    }
+
+    curseforge {
+        client = true
         server = true
         if (mod.isFabric) requires("fabric-api")
     }
