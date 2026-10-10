@@ -22,7 +22,7 @@ public final class CarpetPlayerGameTests {
     private static final int TICK_BASE_X = 8192;
     private static final int FAR_OFFSET = 1280;
 
-    @GameTest(maxTicks = 800)
+    @GameTest(maxTicks = 1000)
     public void distantCarpetPlayersCreateSeparateRegions(GameTestHelper helper) {
         Regionium.scheduler().registerLevel(helper.getLevel());
         Regionium.scheduler().refreshChunkLeases(helper.getLevel());
@@ -34,7 +34,8 @@ public final class CarpetPlayerGameTests {
                 runCommand(helper, "carpet allowSpawningOfflinePlayers true");
                 spawnPairAt(helper, DISTANT_A, DISTANT_B, DISTANT_BASE_X);
             })
-            .thenIdle(100)
+            .thenWaitUntil(() -> waitForPairOwners(helper, DISTANT_A, DISTANT_B))
+            .thenIdle(20)
             .thenExecute(() -> {
                 ServerPlayer a = requirePlayer(helper, DISTANT_A);
                 ServerPlayer b = requirePlayer(helper, DISTANT_B);
@@ -65,7 +66,8 @@ public final class CarpetPlayerGameTests {
                 runCommand(helper, "carpet allowSpawningOfflinePlayers true");
                 spawnPairAt(helper, TRANSFER_A, TRANSFER_B, TRANSFER_BASE_X);
             })
-            .thenIdle(100)
+            .thenWaitUntil(() -> waitForPairOwners(helper, TRANSFER_A, TRANSFER_B))
+            .thenIdle(20)
             .thenExecute(() -> {
                 requirePlayer(helper, TRANSFER_A);
                 requirePlayer(helper, TRANSFER_B);
@@ -124,7 +126,7 @@ public final class CarpetPlayerGameTests {
             .thenSucceed();
     }
 
-    @GameTest(maxTicks = 500)
+    @GameTest(maxTicks = 800)
     public void regionTickStressDoesNotFail(GameTestHelper helper) {
         Regionium.scheduler().registerLevel(helper.getLevel());
         Regionium.scheduler().refreshChunkLeases(helper.getLevel());
@@ -141,6 +143,7 @@ public final class CarpetPlayerGameTests {
                 runCommand(helper, "gamerule randomTickSpeed 1000");
                 spawnPairAt(helper, "RegioniumStressA", "RegioniumStressB", 12288);
             })
+            .thenWaitUntil(() -> waitForPairOwners(helper, "RegioniumStressA", "RegioniumStressB"))
             .thenIdle(100)
             .thenExecute(() -> {
                 ServerPlayer a = requirePlayer(helper, "RegioniumStressA");
@@ -201,7 +204,8 @@ public final class CarpetPlayerGameTests {
                 runCommand(helper, "carpet allowSpawningOfflinePlayers true");
                 spawnPairAt(helper, TICK_A, TICK_B, TICK_BASE_X);
             })
-            .thenIdle(100)
+            .thenWaitUntil(() -> waitForPairOwners(helper, TICK_A, TICK_B))
+            .thenIdle(20)
             .thenExecute(() -> {
                 requirePlayer(helper, TICK_A);
                 requirePlayer(helper, TICK_B);
@@ -278,6 +282,30 @@ public final class CarpetPlayerGameTests {
             helper,
             "player " + second + " spawn at " + (baseX + FAR_OFFSET) + " 80 0"
         );
+    }
+
+    /**
+     * Carpet fake players can be created before their destination chunks have
+     * completed ticket promotion and Regionium topology publication. Do not
+     * treat that asynchronous startup window as a failed region split; wait
+     * for both players to acquire real owners, bounded by the GameTest timeout.
+     */
+    private static void waitForPairOwners(GameTestHelper helper, String first, String second) {
+        ServerPlayer a = findPlayer(helper, first);
+        ServerPlayer b = findPlayer(helper, second);
+        if (a == null || b == null) {
+            throw helper.assertionException(
+                "Waiting for Carpet players to spawn: A=" + (a != null) + ", B=" + (b != null));
+        }
+
+        RegioniumRegion regionA = Regionium.scheduler().regionizer().regionFor(a);
+        RegioniumRegion regionB = Regionium.scheduler().regionizer().regionFor(b);
+        if (regionA == null || regionB == null) {
+            throw helper.assertionException(
+                "Waiting for Regionium chunk ownership: A=" + regionA + ", B=" + regionB
+                    + ", A chunk=" + chunkLifecycle(helper.getLevel(), a.blockPosition())
+                    + ", B chunk=" + chunkLifecycle(helper.getLevel(), b.blockPosition()));
+        }
     }
 
     private static void assertSeparateRegions(
@@ -396,7 +424,8 @@ public final class CarpetPlayerGameTests {
                 runCommand(helper, "carpet allowSpawningOfflinePlayers true");
                 spawnPairAt(helper, "RegioniumChurnA", "RegioniumChurnB", 20480);
             })
-            .thenIdle(100)
+            .thenWaitUntil(() -> waitForPairOwners(helper, "RegioniumChurnA", "RegioniumChurnB"))
+            .thenIdle(20)
             .thenExecute(() -> {
                 ServerPlayer a = requirePlayer(helper, "RegioniumChurnA");
                 ServerPlayer b = requirePlayer(helper, "RegioniumChurnB");
@@ -417,7 +446,8 @@ public final class CarpetPlayerGameTests {
                 runCommand(helper, "player RegioniumChurnB spawn at 21760 80 0");
                 runCommand(helper, "forceload add 21760 0");
             })
-            .thenIdle(100)
+            .thenWaitUntil(() -> waitForPairOwners(helper, "RegioniumChurnA", "RegioniumChurnB"))
+            .thenIdle(20)
             .thenExecute(() -> {
                 ServerPlayer a = requirePlayer(helper, "RegioniumChurnA");
                 ServerPlayer b = requirePlayer(helper, "RegioniumChurnB");
