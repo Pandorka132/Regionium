@@ -10,16 +10,15 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import dev.pandor.regionium.Regionium;
-import net.minecraft.world.entity.EntityType;
 
-public final class ExampleGameTests {
+public final class GameTests {
     private static final String NOOP_TEST_FUNCTION = "noop";
 
-    public ExampleGameTests() {
+    public GameTests() {
         Registry.register(
             BuiltInRegistries.TEST_FUNCTION,
             Identifier.fromNamespaceAndPath(Regionium.MOD_ID.toLowerCase(), NOOP_TEST_FUNCTION),
-            ExampleGameTests::noop
+            GameTests::noop
         );
     }
 

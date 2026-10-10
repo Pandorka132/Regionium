@@ -51,17 +51,24 @@ modSettings {
 publishMods {
     type = ALPHA
     changelog = providers.provider {
-        rootProject.file("CHANGELOG.md").readText()
+        rootProject.file("CHANGELOG.md")
+            .takeIf { it.isFile }
+            ?.readText()
+            ?.takeIf { it.isNotBlank() }
+            ?: "See the GitHub release notes for this version."
     }
 
     modrinth {
-        accessToken.set(providers.gradleProperty("MODRINTH_TOKEN"))
+        projectId.set(providers.environmentVariable("MODRINTH_ID"))
+        accessToken.set(providers.environmentVariable("MODRINTH_TOKEN"))
         if (mod.isFabric) requires("fabric-api")
         environment.set(DEDICATED_SERVER_ONLY)
     }
 
     curseforge {
-        accessToken.set(providers.gradleProperty("CURSEFORGE_TOKEN"))
+        projectId.set(providers.environmentVariable("CURSEFORGE_ID"))
+        projectSlug.set(providers.environmentVariable("CURSEFORGE_SLUG"))
+        accessToken.set(providers.environmentVariable("CURSEFORGE_TOKEN"))
         client = false
         server = true
         if (mod.isFabric) requires("fabric-api")

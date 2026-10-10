@@ -31,17 +31,7 @@ public abstract class ServerPlayerRegioniumPacketMixin implements ServerPlayerRe
     @Override
     public <T extends PacketListener> void regionium$schedulePacket(T listener, Packet<T> packet) {
         regionium$packetProcessor.scheduleIfPossible(listener, packet);
-        boolean queued = ((dev.pandor.regionium.access.PacketProcessorRegioniumAccess)
-            (Object) regionium$packetProcessor).regionium$hasPackets();
         RegioniumWorldData region = regionium$lastRegion;
-        Regionium.LOGGER.trace(
-            "[PACKET-QUEUE] player={} packet={} scheduled={} region={} thread={}",
-            ((ServerPlayer) (Object) this).getGameProfile().name(),
-            packet.getClass().getSimpleName(),
-            queued,
-            region,
-            Thread.currentThread().getName()
-        );
         if (region != null) {
             Regionium.scheduler().notifyRegionPackets(region);
         }

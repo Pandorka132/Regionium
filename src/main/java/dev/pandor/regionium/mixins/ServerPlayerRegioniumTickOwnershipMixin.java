@@ -31,7 +31,7 @@ public abstract class ServerPlayerRegioniumTickOwnershipMixin {
 
         if (Regionium.scheduler().regionizer()
             .owner((net.minecraft.server.level.ServerLevel) player.level(), player.chunkPosition().pack()) != current) {
-            Regionium.LOGGER.warn(
+            Regionium.LOGGER.debug(
                 "[PLAYER-TRANSFER-GATE] player={} region={} chunk={} owner={}",
                 player.getGameProfile().name(),
                 current.id(),
