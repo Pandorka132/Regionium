@@ -8,11 +8,16 @@
   "authors": [
     "Pándor"
   ],
+  "contact": {
+    "homepage": "https://github.com/Pandorka132/Regionium",
+    "sources": "https://github.com/Pandorka132/Regionium",
+    "issues": "https://github.com/Pandorka132/Regionium/issues"
+  },
 
   "license": "MIT",
   "icon": "assets/${id}/icon.png",
 
-  "environment": "*",
+  "environment": "server",
   "entrypoints": {
     "main": [
       "${group}.${id}.Regionium"
@@ -21,7 +26,7 @@
       "${group}.${id}.datagen.fabric.ExampleDataGenerator"
     ],
     "fabric-gametest": [
-      "${group}.${id}.gametest.ExampleGameTests",
+      "${group}.${id}.gametest.GameTests",
       "${group}.${id}.gametest.CarpetPlayerGameTests"
     ]
   },

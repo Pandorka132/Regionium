@@ -197,25 +197,12 @@ public final class RegioniumRegionizer {
         state.chunkHolders.put(chunkKey, holder);
 
         boolean leased = isRegionChunk(holder);
-        boolean wasLeased = state.leasedChunks.contains(chunkKey);
         if (leased) {
             if (state.leasedChunks.add(chunkKey)) {
                 state.topologyDirty = true;
             }
         } else if (state.leasedChunks.remove(chunkKey)) {
             state.topologyDirty = true;
-        }
-
-        if (leased != wasLeased) {
-            Regionium.LOGGER.trace(
-                "[REGION-LIFECYCLE] dim={} chunk={} leased={} ticking={} entityTicking={} owner={}",
-                level.dimension().identifier(),
-                holder.getPos(),
-                leased,
-                holder.getTickingChunk() != null,
-                holder.getEntityTickingChunkFuture().getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK).orElse(null) != null,
-                state.chunkOwners.get(chunkKey) == null ? "none" : state.chunkOwners.get(chunkKey).id()
-            );
         }
 
         // Region-local chunk state is reconciled by the owning region thread.
@@ -385,13 +372,6 @@ public final class RegioniumRegionizer {
         // Entity state is migrated by the owning region after its tick.
         // Rebuilding topology must never touch another region's mutable data.
 
-        Regionium.LOGGER.trace(
-            "[REGIONIZER] level={} chunks={} sections={} regions={}",
-            level.dimension().identifier(),
-            nextOwners.size(),
-            currentSections.size(),
-            used.size()
-        );
     }
 
     private void migrateEntities(ServerLevel level, LevelState state) {
@@ -433,13 +413,6 @@ public final class RegioniumRegionizer {
                     .regionium$updateRegion(destination.worldData());
             }
 
-            Regionium.LOGGER.trace(
-                "[REGION-MIGRATE] entity={} {} -> {} chunk={}",
-                entity.getType(),
-                source == null ? -1 : source.id(),
-                destination.id(),
-                entity.chunkPosition()
-            );
         }
     }
 
@@ -733,19 +706,6 @@ public final class RegioniumRegionizer {
         RegioniumRegion destination = state.chunkOwners.get(chunkKey);
         RegioniumRegion source = findEntityRegion(state.regions, entity);
 
-        if (entity instanceof ServerPlayer player) {
-            if (destination == null || source != destination) {
-                Regionium.LOGGER.trace(
-                    "[PLAYER-OWNER] player={} chunk={} source={} destination={} leased={}",
-                    player.getGameProfile().name(),
-                    player.chunkPosition(),
-                    source == null ? "none" : source.id(),
-                    destination == null ? "none" : destination.id(),
-                    state.leasedChunks.contains(chunkKey)
-                );
-            }
-        }
-
         if (destination == null) {
             return;
         }
@@ -762,7 +722,7 @@ public final class RegioniumRegionizer {
         if (entity instanceof ServerPlayer player) {
             ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
                 .regionium$updateRegion(destination.worldData());
-            Regionium.LOGGER.info(
+            Regionium.LOGGER.debug(
                 "[PLAYER-REGION] player={} {} -> {} chunk={}",
                 player.getGameProfile().name(),
                 source == null ? -1 : source.id(),

@@ -46,7 +46,6 @@ public abstract class LevelRegioniumThreadMixin {
     ) {
         ChunkAccess chunk = original.call(level, x, z, status);
         if (chunk instanceof ImposterProtoChunk imposter) {
-            Regionium.LOGGER.trace("[MT] unwrapping ImposterProtoChunk at [{}, {}] on {}", x, z, Thread.currentThread().getName());
             return imposter.getWrapped();
         }
         return chunk;

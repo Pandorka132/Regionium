@@ -416,10 +416,6 @@ public final class RegioniumScheduler implements AutoCloseable {
         // A region becomes schedulable only after the regionizer has acquired
         // actual chunk lifecycle state and marked that region active.
 
-        Regionium.LOGGER.trace(
-            "Registered level {}; spatial regions are created dynamically by the regionizer",
-            level.dimension().identifier()
-        );
     }
 
     private RegioniumRegion createRegion(ServerLevel level) {
