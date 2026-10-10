@@ -49,6 +49,8 @@
     "ChunkMapRegioniumVisibleAccessorMixin",
     "LevelChunkRegioniumTickAccessorMixin",
     "CollectingNeighborUpdaterRegioniumAccessorMixin",
+    "CollectingNeighborUpdaterRegioniumShapeRoutingMixin",
+    "NeighborUpdaterRegioniumCrossRegionMixin",
     "ServerLevelNeighborUpdaterRegioniumMixin",
     "ServerLevelNeighborUpdaterRegioniumAccessorMixin",
     "ServerConnectionListenerRegioniumMixin",

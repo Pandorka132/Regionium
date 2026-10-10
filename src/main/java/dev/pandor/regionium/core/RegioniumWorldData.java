@@ -1,6 +1,8 @@
 package dev.pandor.regionium.core;
 
 import dev.pandor.regionium.Regionium;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -20,7 +22,6 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The mutable state owned by exactly one region.
@@ -39,6 +40,10 @@ public final class RegioniumWorldData {
         Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<LevelChunk> chunks =
         Collections.newSetFromMap(new IdentityHashMap<>());
+    // Neighbor-update ownership checks run in the redstone hot path. Keep a
+    // primitive chunk-key index so each check is O(1), not a scan of every
+    // LevelChunk in this region, and avoid boxing a Long per lookup.
+    private final LongSet chunkPositions = new LongOpenHashSet();
     private final Set<LevelChunk> tickingChunks =
         Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<LevelChunk> entityTickingChunks =
@@ -54,8 +59,6 @@ public final class RegioniumWorldData {
     private final NeighborUpdater neighborUpdater;
 
     private final List<BlockEventData> blockEvents = new ArrayList<>();
-    private final AtomicLong redstoneTime = new AtomicLong(1L);
-    private final AtomicLong subTickOrder = new AtomicLong();
     private volatile boolean handlingTick;
     private volatile boolean tickingBlockEntities;
 
@@ -131,18 +134,6 @@ public final class RegioniumWorldData {
         return blockEvents;
     }
 
-    public long redstoneTime() {
-        return redstoneTime.get();
-    }
-
-    public void setRedstoneTime(long value) {
-        redstoneTime.set(value);
-    }
-
-    public long nextSubTickOrder() {
-        return subTickOrder.incrementAndGet();
-    }
-
     public boolean isHandlingTick() {
         return handlingTick;
     }
@@ -177,6 +168,7 @@ public final class RegioniumWorldData {
         if (!chunks.add(chunk)) {
             return;
         }
+        chunkPositions.add(chunk.getPos().pack());
 
         try {
             var access = (dev.pandor.regionium.mixins.LevelChunkRegioniumTickAccessorMixin) chunk;
@@ -189,6 +181,15 @@ public final class RegioniumWorldData {
 
             blockTicks.addContainer(chunk.getPos(), block);
             fluidTicks.addContainer(chunk.getPos(), fluid);
+
+            // The vanilla chunk owns the authoritative, rebindable ticker
+            // wrappers. Reconcile them whenever a chunk enters a region so
+            // both freshly loaded chunks and ownership migrations recover all
+            // existing block-entity tickers instead of silently losing them.
+            for (TickingBlockEntity ticker : access.regionium$getTickersInLevel().values()) {
+                addBlockEntityTicker(ticker);
+            }
+            Regionium.scheduler().flushDeferredNeighborUpdates(level, chunk.getPos().pack(), region);
         } catch (Throwable error) {
             Regionium.LOGGER.error(
                 "Failed to register chunk {} in region {}",
@@ -203,10 +204,21 @@ public final class RegioniumWorldData {
         if (!chunks.remove(chunk)) {
             return;
         }
+        chunkPositions.remove(chunk.getPos().pack());
         blockTicks.removeContainer(chunk.getPos());
         fluidTicks.removeContainer(chunk.getPos());
         tickingChunks.remove(chunk);
         entityTickingChunks.remove(chunk);
+
+        // A chunk unload invalidates every ticker wrapper backed by that
+        // chunk. Keeping one in the region list lets an obsolete piston-moving
+        // block entity continue ticking after the chunk was detached, and can
+        // reintroduce stale block-entity state when the chunk is reloaded.
+        long chunkKey = chunk.getPos().pack();
+        blockEntityTickers.removeIf(ticker ->
+            net.minecraft.world.level.ChunkPos.containing(ticker.getPos()).pack() == chunkKey);
+        pendingBlockEntityTickers.removeIf(ticker ->
+            net.minecraft.world.level.ChunkPos.containing(ticker.getPos()).pack() == chunkKey);
     }
 
     public void setTickingChunk(LevelChunk chunk, boolean ticking) {
@@ -231,8 +243,31 @@ public final class RegioniumWorldData {
         }
     }
 
+    /** Remove a ticker from this region's lists while its ownership is being transferred. */
+    public void removeBlockEntityTicker(TickingBlockEntity ticker) {
+        blockEntityTickers.removeIf(candidate -> candidate == ticker);
+        pendingBlockEntityTickers.removeIf(candidate -> candidate == ticker);
+    }
+
     public void addBlockEntityTicker(TickingBlockEntity ticker) {
-        blockEntityTickers.add(ticker);
+        if (containsTicker(ticker)) {
+            return;
+        }
+        (tickingBlockEntities ? pendingBlockEntityTickers : blockEntityTickers).add(ticker);
+    }
+
+    public boolean containsTicker(TickingBlockEntity ticker) {
+        for (TickingBlockEntity candidate : blockEntityTickers) {
+            if (candidate == ticker) {
+                return true;
+            }
+        }
+        for (TickingBlockEntity candidate : pendingBlockEntityTickers) {
+            if (candidate == ticker) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public void pushPendingBlockEntityTickers() {
@@ -259,13 +294,12 @@ public final class RegioniumWorldData {
         return chunks.contains(chunk);
     }
 
+    public boolean hasChunk(long chunkPos) {
+        return chunkPositions.contains(chunkPos);
+    }
+
     private boolean ownsChunk(long chunkPos) {
-        for (LevelChunk chunk : chunks) {
-            if (chunk.getPos().pack() == chunkPos) {
-                return true;
-            }
-        }
-        return false;
+        return chunkPositions.contains(chunkPos);
     }
 
     /*
@@ -283,8 +317,6 @@ public final class RegioniumWorldData {
     public LevelTicks<Block> blockTicks(RegioniumRegion ignored) { return blockTicks; }
     public LevelTicks<Fluid> fluidTicks(RegioniumRegion ignored) { return fluidTicks; }
     public NeighborUpdater neighborUpdater(RegioniumRegion ignored) { return neighborUpdater; }
-    public long redstoneTime(RegioniumRegion ignored) { return redstoneTime(); }
-    public void setRedstoneTime(RegioniumRegion ignored, long value) { setRedstoneTime(value); }
     public List<BlockEventData> deferredBlockEvents(RegioniumRegion ignored) { return blockEvents; }
 
     public void add(Entity entity, RegioniumRegion ignored) { add(entity); }

@@ -8,4 +8,8 @@ import org.spongepowered.asm.mixin.gen.Invoker;
 public interface ServerLevelTickTimeInvokerMixin {
     @Invoker("tickTime")
     void regionium$invokeTickTime();
+
+    @Invoker("advanceWeatherCycle")
+    void regionium$advanceWeatherCycle();
+
 }

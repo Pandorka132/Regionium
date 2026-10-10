@@ -1,9 +1,13 @@
 package dev.pandor.regionium.mixins;
 
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.ticks.LevelChunkTicks;
-import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.material.Fluid;
+
+import java.util.Map;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
 
@@ -14,4 +18,7 @@ public interface LevelChunkRegioniumTickAccessorMixin {
 
     @Accessor("fluidTicks")
     LevelChunkTicks<Fluid> regionium$getFluidTicks();
+
+    @Accessor("tickersInLevel")
+    Map<BlockPos, TickingBlockEntity> regionium$getTickersInLevel();
 }

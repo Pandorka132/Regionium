@@ -1,6 +1,8 @@
 package dev.pandor.regionium.mixins;
 
 import dev.pandor.regionium.Regionium;
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -21,32 +23,34 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 
 /**
- * Gives CollectingNeighborUpdater each execution thread's own mutable state.
+ * Gives each CollectingNeighborUpdater instance its own execution-context state.
  *
- * Vanilla stores stack/addedThisLayer/count directly on one Level-wide updater.
- * Regionium has multiple region workers entering that updater concurrently,
- * so sharing those fields corrupts the redstone state machine.
+ * Regionium owns one updater per region. A ThreadLocal shared by all updater
+ * instances is not sufficient: nested callbacks can enter another region's
+ * updater on the same worker and would otherwise mix both state machines.
  */
 @Mixin(CollectingNeighborUpdater.class)
 public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
     @Unique
-    private static final ThreadLocal<ArrayDeque<Object>> regionium$stack =
-        ThreadLocal.withInitial(ArrayDeque::new);
+    private static final ThreadLocal<IdentityHashMap<CollectingNeighborUpdater, RegioniumUpdaterState>> regionium$states =
+        ThreadLocal.withInitial(IdentityHashMap::new);
 
     @Unique
-    private static final ThreadLocal<List<Object>> regionium$addedThisLayer =
-        ThreadLocal.withInitial(ArrayList::new);
+    private static RegioniumUpdaterState regionium$state(CollectingNeighborUpdater updater) {
+        return regionium$states.get().computeIfAbsent(updater, ignored -> new RegioniumUpdaterState());
+    }
 
     @Unique
-    private static final ThreadLocal<int[]> regionium$count =
-        ThreadLocal.withInitial(() -> new int[1]);
-
-    @Unique
-    private static final ThreadLocal<int[]> regionium$runDepth =
-        ThreadLocal.withInitial(() -> new int[1]);
+    private static final class RegioniumUpdaterState {
+        private final ArrayDeque<Object> stack = new ArrayDeque<>();
+        private final List<Object> addedThisLayer = new ArrayList<>();
+        private int count;
+        private int runDepth;
+    }
 
     @Redirect(
         method = {"addAndRun", "runUpdates"},
@@ -57,7 +61,7 @@ public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
         )
     )
     private ArrayDeque regionium$getStack(CollectingNeighborUpdater self) {
-        return regionium$stack.get();
+        return regionium$state(self).stack;
     }
 
     @Redirect(
@@ -69,7 +73,7 @@ public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
         )
     )
     private List regionium$getAddedThisLayer(CollectingNeighborUpdater self) {
-        return regionium$addedThisLayer.get();
+        return regionium$state(self).addedThisLayer;
     }
 
     @Redirect(
@@ -81,7 +85,7 @@ public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
         )
     )
     private int regionium$getCount(CollectingNeighborUpdater self) {
-        return regionium$count.get()[0];
+        return regionium$state(self).count;
     }
 
     @Redirect(
@@ -93,26 +97,32 @@ public abstract class CollectingNeighborUpdaterRegioniumConcurrencyMixin {
         )
     )
     private void regionium$setCount(CollectingNeighborUpdater self, int value) {
-        regionium$count.get()[0] = value;
+        regionium$state(self).count = value;
     }
 
-    @Inject(method = "runUpdates", at = @At("HEAD"))
-    private void regionium$enterRunUpdates(CallbackInfo ci) {
-        regionium$runDepth.get()[0]++;
-    }
-
-    @Inject(method = "runUpdates", at = @At("RETURN"))
-    private void regionium$cleanupThreadLocalState(CallbackInfo ci) {
-        int[] depth = regionium$runDepth.get();
-        depth[0]--;
-        if (depth[0] > 0) {
-            return;
+    @WrapMethod(method = "runUpdates")
+    private void regionium$cleanupThreadLocalState(Operation<Void> original) throws Throwable {
+        CollectingNeighborUpdater updater = (CollectingNeighborUpdater) (Object) this;
+        IdentityHashMap<CollectingNeighborUpdater, RegioniumUpdaterState> states = regionium$states.get();
+        RegioniumUpdaterState state = regionium$state(updater);
+        state.runDepth++;
+        try {
+            original.call();
+        } finally {
+            state.runDepth--;
+            if (state.runDepth <= 0) {
+                // Vanilla also clears these fields in runUpdates' finally.
+                // Keep cleanup as a safety net, but only for this updater:
+                // another updater may be active on the same worker.
+                state.stack.clear();
+                state.addedThisLayer.clear();
+                state.count = 0;
+                states.remove(updater);
+                if (states.isEmpty()) {
+                    regionium$states.remove();
+                }
+            }
         }
-
-        regionium$stack.get().clear();
-        regionium$addedThisLayer.get().clear();
-        regionium$count.get()[0] = 0;
-        depth[0] = 0;
     }
 }
 
