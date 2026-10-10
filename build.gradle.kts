@@ -49,12 +49,19 @@ modSettings {
 }
 
 publishMods {
+    type = ALPHA
+    changelog = providers.fileContents(
+        layout.projectDirectory.file("CHANGELOG.md")
+    ).asText
+
     modrinth {
+        accessToken.set(providers.gradleProperty("MODRINTH_TOKEN"))
         if (mod.isFabric) requires("fabric-api")
-        environment.set(CLIENT_OR_SERVER_PREFERS_BOTH)
+        environment.set(DEDICATED_SERVER_ONLY)
     }
 
     curseforge {
+        accessToken.set(providers.gradleProperty("CURSEFORGE_TOKEN"))
         client = false
         server = true
         if (mod.isFabric) requires("fabric-api")

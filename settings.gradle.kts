@@ -12,6 +12,7 @@ pluginManagement {
     }
 }
 plugins {
+    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
     id("gg.meza.stonecraft") version "1.14.2"
     id("dev.kikugie.stonecutter") version "0.9+"
 }
