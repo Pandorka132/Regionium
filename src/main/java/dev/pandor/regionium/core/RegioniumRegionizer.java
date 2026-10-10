@@ -22,6 +22,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.concurrent.locks.StampedLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -40,6 +42,14 @@ public final class RegioniumRegionizer {
     private final Map<ServerLevel, LevelState> worlds =
         Collections.synchronizedMap(new IdentityHashMap<>());
     private final StampedLock lifecycleLock = new StampedLock();
+    // A topology publication is an ownership transfer. It must wait until every
+    // in-flight region tick has left the old ownership snapshot; otherwise a
+    // departing and arriving region can concurrently tick the same LevelChunk.
+    // Non-fair is intentional: a topology/save writer may wait for a slow
+    // region, but it must not prevent unrelated regions from acquiring the
+    // read side while that writer is queued. A fair lock turns one slow region
+    // into a global tick barrier.
+    private final ReentrantReadWriteLock regionTickBarrier = new ReentrantReadWriteLock(false);
     private final Function<ServerLevel, RegioniumRegion> regionFactory;
 
     public RegioniumRegionizer(Function<ServerLevel, RegioniumRegion> regionFactory) {
@@ -47,14 +57,48 @@ public final class RegioniumRegionizer {
     }
 
     /**
-     * Region ticks do not hold the global topology lock. Folia regions continue
-     * ticking while the global chunk topology is being updated; the topology
-     * lock is only held for the short ownership-map rebuild itself.
+     * Pins the published chunk ownership snapshot for the full region tick.
+     * Topology changes take the write lock, so ownership cannot change while
+     * a region is mutating chunks selected from the previous snapshot.
      */
     public void enterRegionTick() {
+        regionTickBarrier.readLock().lock();
     }
 
     public void exitRegionTick() {
+        regionTickBarrier.readLock().unlock();
+    }
+
+    /**
+     * Excludes every region tick while vanilla copies a chunk into its
+     * SerializableChunkData snapshot. Synchronizing on LevelChunk alone is
+     * insufficient: vanilla block/random ticks and block-entity ticks do not
+     * all acquire that monitor before mutating the chunk.
+     *
+     * The lock is held only for the in-memory snapshot, never for asynchronous
+     * disk I/O. ChunkMap.save() invokes copyOf() synchronously before it queues
+     * the serialized data for background writing.
+     */
+    public boolean enterChunkSaveSnapshot() {
+        // GameTests rely on deterministic snapshots and have no real command
+        // latency to protect, so retain the strict barrier there.
+        if (Regionium.scheduler().isGameTestDriven()) {
+            while (!regionTickBarrier.writeLock().tryLock()) {
+                LockSupport.parkNanos(100_000L);
+            }
+            return true;
+        }
+
+        // ChunkMap.save() runs synchronously on the server thread. It must
+        // never wait for every region to finish ticking: one slow region would
+        // otherwise freeze command dispatch and all global-server work. The
+        // caller skips this save attempt if the barrier is unavailable, keeping
+        // the snapshot consistent and allowing a later save pass to retry.
+        return regionTickBarrier.writeLock().tryLock();
+    }
+
+    public void exitChunkSaveSnapshot() {
+        regionTickBarrier.writeLock().unlock();
     }
 
     public void registerLevel(ServerLevel level) {
@@ -122,9 +166,24 @@ public final class RegioniumRegionizer {
 
             long chunkKey = holder.getPos().pack();
             state.chunkHolders.put(chunkKey, holder);
-            state.topologyDirty = true;
+
+            // updateFutures() also runs for ticking/entity-ticking future
+            // changes. Those are simulation-state transitions, not spatial
+            // topology changes: Folia's regionizer is driven by holder
+            // creation/destruction. Rebalancing for every future update makes
+            // the server thread queue a global write lock continuously.
+            boolean loaded = net.minecraft.server.level.ChunkLevel.isLoaded(holder.getTicketLevel());
+            boolean tracked = state.regionChunks.contains(chunkKey);
+            if (loaded && !tracked) {
+                state.regionChunks.add(chunkKey);
+                state.topologyDirty = true;
+            } else if (!loaded && tracked) {
+                state.regionChunks.remove(chunkKey);
+                state.leasedChunks.remove(chunkKey);
+                state.topologyDirty = true;
+            }
         } finally {
-            lifecycleLock.tryUnlockWrite();
+            lifecycleLock.unlockWrite(stamp);
         }
     }
 
@@ -165,23 +224,33 @@ public final class RegioniumRegionizer {
 
     public void rebalance(ServerLevel level) {
         LevelState state = worlds.get(level);
-        if (state == null) {
+        if (state == null || !state.topologyDirty) {
             return;
         }
 
-        if (!state.topologyDirty) {
+        // Lock order is always tick barrier -> lifecycle lock. A region tick
+        // holds the read side before it consults the lifecycle snapshot, so
+        // taking these locks in the reverse order here would deadlock. Never
+        // queue a topology writer behind an active region tick: a queued writer
+        // can prevent unrelated region ticks from acquiring the read lock. If
+        // any region is still ticking, leave topologyDirty set and retry on the
+        // next global server tick instead of turning this into a global stall.
+        if (!regionTickBarrier.writeLock().tryLock()) {
             return;
         }
-
-        lifecycleLock.writeLock();
         try {
-            state = worlds.get(level);
-            if (state == null || !state.topologyDirty) {
-                return;
+            lifecycleLock.writeLock();
+            try {
+                state = worlds.get(level);
+                if (state == null || !state.topologyDirty) {
+                    return;
+                }
+                rebalanceLocked(level);
+            } finally {
+                lifecycleLock.tryUnlockWrite();
             }
-            rebalanceLocked(level);
         } finally {
-            lifecycleLock.tryUnlockWrite();
+            regionTickBarrier.writeLock().unlock();
         }
     }
 
@@ -290,37 +359,11 @@ public final class RegioniumRegionizer {
         }
 
         /*
-         * Apply chunk ownership changes as actual region-data migration.
-         * The old region stops owning the chunk before the destination starts
-         * ticking it. There is never a tick where both own the same chunk.
+         * Region-local chunk lists are reconciled by each region on its next
+         * tick. The write side of regionTickBarrier above ensures no old-owner
+         * tick can still be running when this new ownership snapshot is
+         * published. Every tick checks ownership before ticking a chunk.
          */
-        for (Map.Entry<Long, RegioniumRegion> entry : oldOwners.entrySet()) {
-            long chunkKey = entry.getKey();
-            RegioniumRegion from = entry.getValue();
-            RegioniumRegion to = nextOwners.get(chunkKey);
-
-            ChunkHolder holder = state.chunkHolders.get(chunkKey);
-            LevelChunk chunk = holder == null ? null : holder.getTickingChunk();
-
-            if (to == from) {
-                // Ownership can become established before ChunkMap has
-                // produced the actual ticking LevelChunk. Reconcile the
-                // region-local chunk state on every topology pass so the
-                // later promotion is not lost just because the owner itself
-                // did not change.
-                continue;
-            }
-
-        }
-
-        for (Map.Entry<Long, RegioniumRegion> entry : nextOwners.entrySet()) {
-            if (oldOwners.get(entry.getKey()) != null) {
-                continue;
-            }
-
-            ChunkHolder holder = state.chunkHolders.get(entry.getKey());
-            LevelChunk chunk = holder == null ? null : holder.getTickingChunk();
-        }
 
         // Publish atomically: readers see either the old topology or the new
         // topology, never the empty/partially copied map.

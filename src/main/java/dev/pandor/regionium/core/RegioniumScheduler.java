@@ -24,6 +24,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.LinkedHashSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Future;
 import java.util.concurrent.ExecutionException;
@@ -38,14 +40,16 @@ import java.util.function.Consumer;
  *
  * The server thread only performs global chunk lifecycle work and regionizer
  * topology maintenance. It never releases a global "tick batch". Each region
- * is independently scheduled onto a shared worker pool.
+ * is independently scheduled onto a stable worker; distinct workers run in parallel.
  */
 public final class RegioniumScheduler implements AutoCloseable {
     public static final int DEFAULT_REGION_COUNT =
         Math.clamp(Runtime.getRuntime().availableProcessors(), 1, 16);
 
-    private final int regionCount;
-    private final ScheduledThreadPoolExecutor workers;
+    // Each executor owns exactly one physical worker. Regions are assigned to
+    // one executor for their lifetime, preserving worker affinity between ticks.
+    private final List<ScheduledThreadPoolExecutor> workers;
+    private final AtomicInteger nextWorkerIndex = new AtomicInteger();
     private final RegioniumRegionizer regionizer;
 
     private final Map<ServerLevel, List<RegioniumRegion>> levelRegions =
@@ -56,6 +60,13 @@ public final class RegioniumScheduler implements AutoCloseable {
     private final PacketProcessor globalPacketProcessor = new PacketProcessor(null);
     private final Set<ChunkExecutionKey> activeChunkExecutions =
         ConcurrentHashMap.newKeySet();
+    private final ConcurrentMap<ChunkExecutionKey, AtomicInteger> queuedNeighborExecutions =
+        new ConcurrentHashMap<>();
+    // Neighbor callbacks are normally synchronous in vanilla. Region ownership
+    // requires cross-region dispatch, so retain callbacks until their target
+    // chunk is owned and loaded instead of silently discarding them on unload.
+    private final ConcurrentMap<NeighborUpdateKey, ConcurrentLinkedQueue<Runnable>> deferredNeighborUpdates =
+        new ConcurrentHashMap<>();
 
     /*
      * Vanilla's ChunkMap.move() is a global chunk-tracking operation. Region
@@ -75,7 +86,6 @@ public final class RegioniumScheduler implements AutoCloseable {
 
     private volatile long tick;
     private static final AtomicInteger NEXT_REGION_ID = new AtomicInteger();
-    private static final AtomicInteger NEXT_WORKER_ID = new AtomicInteger();
     private static final AtomicInteger DEBUG_ACTIVE_WORKERS = new AtomicInteger();
     private static final AtomicInteger DEBUG_MAX_WORKERS = new AtomicInteger();
 
@@ -90,31 +100,28 @@ public final class RegioniumScheduler implements AutoCloseable {
             throw new IllegalArgumentException("regionCount must be positive");
         }
 
-        this.regionCount = regionCount;
-
-        ThreadFactory factory = runnable -> {
-            Thread thread = new Thread(
-                runnable,
-                "Regionium-Worker-" + NEXT_WORKER_ID.getAndIncrement()
-            );
-            thread.setDaemon(true);
-            thread.setUncaughtExceptionHandler((t, error) -> {
-                Regionium.LOGGER.error("Uncaught exception in Regionium worker {}", t.getName(), error);
-            });
-            return thread;
-        };
-
         int workerThreads = Math.max(
             1,
             Math.min(regionCount, Runtime.getRuntime().availableProcessors())
         );
-        this.workers = new ScheduledThreadPoolExecutor(
-            workerThreads,
-            factory
-        );
-        this.workers.setRemoveOnCancelPolicy(true);
-        this.workers.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
-        this.workers.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+        List<ScheduledThreadPoolExecutor> workerExecutors = new ArrayList<>(workerThreads);
+        for (int workerIndex = 0; workerIndex < workerThreads; workerIndex++) {
+            final int stableWorkerIndex = workerIndex;
+            ThreadFactory factory = runnable -> {
+                Thread thread = new Thread(runnable, "Regionium-Worker-" + stableWorkerIndex);
+                thread.setDaemon(true);
+                thread.setUncaughtExceptionHandler((t, error) -> {
+                    Regionium.LOGGER.error("Uncaught exception in Regionium worker {}", t.getName(), error);
+                });
+                return thread;
+            };
+            ScheduledThreadPoolExecutor worker = new ScheduledThreadPoolExecutor(1, factory);
+            worker.setRemoveOnCancelPolicy(true);
+            worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+            worker.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+            workerExecutors.add(worker);
+        }
+        this.workers = List.copyOf(workerExecutors);
 
         this.regionizer = new RegioniumRegionizer(this::createRegion);
         running.set(true);
@@ -292,6 +299,16 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
     }
 
+    /**
+     * Runs vanilla world-wide weather and sky updates once per global server
+     * tick. Regionium does not run the vanilla global ServerLevel tick, and
+     * the region-thread wrapper intentionally skips these global operations.
+     */
+    public void tickGlobalWeather(ServerLevel level) {
+        var invoker = (dev.pandor.regionium.mixins.ServerLevelTickTimeInvokerMixin) (Object) level;
+        invoker.regionium$advanceWeatherCycle();
+    }
+
     public void setGameTestDriven(boolean enabled) {
         boolean previous = gameTestDriven.getAndSet(enabled);
         if (enabled && !previous) {
@@ -329,7 +346,7 @@ public final class RegioniumScheduler implements AutoCloseable {
 
         List<Future<?>> futures = new ArrayList<>(active.size());
         for (RegioniumRegion region : active) {
-            futures.add(workers.submit(region::runTickForGameTest));
+            futures.add(region.submitGameTestTick());
         }
 
         for (Future<?> future : futures) {
@@ -362,11 +379,10 @@ public final class RegioniumScheduler implements AutoCloseable {
     }
 
     /**
-     * Number of worker threads currently created by the shared scheduler.
-     * Regions are scheduling units and are not permanently assigned to workers.
+     * Number of dedicated Regionium worker threads available for region ticks.
      */
     public int workerCount() {
-        return workers.getCorePoolSize();
+        return workers.size();
     }
 
     public void finishServerTick() {
@@ -407,10 +423,11 @@ public final class RegioniumScheduler implements AutoCloseable {
     }
 
     private RegioniumRegion createRegion(ServerLevel level) {
+        int workerIndex = Math.floorMod(nextWorkerIndex.getAndIncrement(), workers.size());
         RegioniumRegion region = new RegioniumRegion(
             NEXT_REGION_ID.getAndIncrement(),
             level,
-            workers
+            workers.get(workerIndex)
         );
         region.setTickBody(() -> tickRegion(region));
         return region;
@@ -459,15 +476,16 @@ public final class RegioniumScheduler implements AutoCloseable {
             return false;
         }
 
-        long now = level.getLevelData().getGameTime();
-        long delay = Math.max(0L, tick.triggerTick() - now);
-        long trigger = region.worldData().redstoneTime() + delay;
-        long order = region.worldData().nextSubTickOrder();
+        // ScheduledTick.triggerTick is serialized by vanilla in world game
+        // time. Do not translate it to a region-local clock: after chunk
+        // unload/reload or region reassignment, that timestamp would refer to
+        // a different epoch and a clock could remain stalled indefinitely.
+        long trigger = tick.triggerTick();
 
         if (tick.type() instanceof net.minecraft.world.level.block.Block block) {
             region.worldData().blockTicks().schedule(
                 new net.minecraft.world.ticks.ScheduledTick<>(
-                    block, tick.pos(), trigger, tick.priority(), order
+                    block, tick.pos(), trigger, tick.priority(), tick.subTickOrder()
                 )
             );
             return true;
@@ -476,7 +494,7 @@ public final class RegioniumScheduler implements AutoCloseable {
         if (tick.type() instanceof net.minecraft.world.level.material.Fluid fluid) {
             region.worldData().fluidTicks().schedule(
                 new net.minecraft.world.ticks.ScheduledTick<>(
-                    fluid, tick.pos(), trigger, tick.priority(), order
+                    fluid, tick.pos(), trigger, tick.priority(), tick.subTickOrder()
                 )
             );
             return true;
@@ -524,6 +542,86 @@ public final class RegioniumScheduler implements AutoCloseable {
         return Set.copyOf(worldData(level).entities());
     }
 
+    public void dispatchNeighborUpdate(ServerLevel level, long chunkPos, Runnable operation) {
+        Objects.requireNonNull(level, "level");
+        Objects.requireNonNull(operation, "operation");
+        RegioniumRegion owner = regionizer.owner(level, chunkPos);
+        if (owner == null || owner.isRetired()) {
+            deferNeighborUpdate(level, chunkPos, operation);
+            return;
+        }
+
+        if (RegioniumContext.currentRegion() == owner) {
+            if (owner.worldData().hasChunk(chunkPos)) {
+                operation.run();
+            } else {
+                deferNeighborUpdate(level, chunkPos, operation);
+            }
+            return;
+        }
+
+        // A queued callback is part of the target chunk's in-flight update.
+        // Pin it against ChunkMap.processUnloads until the owning region has
+        // either completed the callback or safely deferred it for a reload.
+        beginQueuedNeighborExecution(level, chunkPos);
+        boolean accepted = owner.execute(() -> {
+            try {
+                RegioniumRegion actualOwner = regionizer.owner(level, chunkPos);
+                if (actualOwner == null || actualOwner.isRetired()
+                    || !actualOwner.worldData().hasChunk(chunkPos)) {
+                    deferNeighborUpdate(level, chunkPos, operation);
+                    return;
+                }
+                if (actualOwner != owner) {
+                    dispatchNeighborUpdate(level, chunkPos, operation);
+                    return;
+                }
+                operation.run();
+            } finally {
+                endQueuedNeighborExecution(level, chunkPos);
+            }
+        });
+        if (!accepted) {
+            endQueuedNeighborExecution(level, chunkPos);
+            deferNeighborUpdate(level, chunkPos, operation);
+        }
+    }
+
+    private void beginQueuedNeighborExecution(ServerLevel level, long chunkPos) {
+        queuedNeighborExecutions.computeIfAbsent(
+            new ChunkExecutionKey(level, chunkPos), ignored -> new AtomicInteger()
+        ).incrementAndGet();
+    }
+
+    private void endQueuedNeighborExecution(ServerLevel level, long chunkPos) {
+        ChunkExecutionKey key = new ChunkExecutionKey(level, chunkPos);
+        queuedNeighborExecutions.computeIfPresent(key, (ignored, count) ->
+            count.decrementAndGet() <= 0 ? null : count
+        );
+    }
+
+    private void deferNeighborUpdate(ServerLevel level, long chunkPos, Runnable operation) {
+        deferredNeighborUpdates.computeIfAbsent(
+            new NeighborUpdateKey(level, chunkPos), ignored -> new ConcurrentLinkedQueue<>()
+        ).offer(operation);
+    }
+
+    public void flushDeferredNeighborUpdates(ServerLevel level, long chunkPos, RegioniumRegion owner) {
+        if (RegioniumContext.currentRegion() != owner || owner.isRetired()
+            || regionizer.owner(level, chunkPos) != owner || !owner.worldData().hasChunk(chunkPos)) {
+            return;
+        }
+        NeighborUpdateKey key = new NeighborUpdateKey(level, chunkPos);
+        ConcurrentLinkedQueue<Runnable> pending = deferredNeighborUpdates.remove(key);
+        if (pending == null) {
+            return;
+        }
+        Runnable operation;
+        while ((operation = pending.poll()) != null) {
+            operation.run();
+        }
+    }
+
     public void prepareChunkExecution(ServerLevel level) {
         registerLevel(level);
         regionizer.rebalance(level);
@@ -535,10 +633,18 @@ public final class RegioniumScheduler implements AutoCloseable {
     ) {
         RegioniumRegion current = RegioniumContext.requireRegionThread();
         for (LevelChunk chunk : List.copyOf(current.worldData().tickingChunks())) {
-            if (regionizer.owner(level, chunk.getPos().pack()) != current) {
+            long chunkPos = chunk.getPos().pack();
+            if (regionizer.owner(level, chunkPos) != current) {
                 continue;
             }
-            vanillaTick.accept(chunk);
+            beginChunkExecution(level, chunkPos);
+            try {
+                if (regionizer.owner(level, chunkPos) == current && current.worldData().hasChunk(chunkPos)) {
+                    vanillaTick.accept(chunk);
+                }
+            } finally {
+                endChunkExecution(level, chunkPos);
+            }
         }
     }
 
@@ -551,7 +657,9 @@ public final class RegioniumScheduler implements AutoCloseable {
     }
 
     public boolean isChunkExecutionActive(ServerLevel level, long chunkPos) {
-        return activeChunkExecutions.contains(new ChunkExecutionKey(level, chunkPos));
+        ChunkExecutionKey key = new ChunkExecutionKey(level, chunkPos);
+        AtomicInteger queued = queuedNeighborExecutions.get(key);
+        return activeChunkExecutions.contains(key) || (queued != null && queued.get() > 0);
     }
 
     public void deferScheduledTick(Object levelTicks, net.minecraft.world.ticks.ScheduledTick<?> tick) {
@@ -592,7 +700,7 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
 
         regionTicks.tick(
-            current.worldData().redstoneTime(),
+            level.getLevelData().getGameTime(),
             maxTicks,
             callback
         );
@@ -625,8 +733,18 @@ public final class RegioniumScheduler implements AutoCloseable {
             return;
         }
 
-        if (target != null) {
-            target.execute(() -> target.worldData().pushBlockEvent(event));
+        if (target != null && !target.isRetired()) {
+            target.execute(() -> {
+                // Ownership may change between selecting the destination and
+                // executing this task. Re-route rather than placing the event
+                // into a stale region's queue.
+                RegioniumRegion actualOwner = regionizer.owner(level, ChunkPos.pack(event.pos()));
+                if (actualOwner == target && !target.isRetired()) {
+                    target.worldData().pushBlockEvent(event);
+                } else if (actualOwner != null) {
+                    deferBlockEvent(level, event);
+                }
+            });
         }
     }
 
@@ -637,7 +755,41 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
 
         for (BlockEventData event : List.copyOf(data.blockEvents())) {
-            var state = level.getBlockState(event.pos());
+            RegioniumRegion owner = regionizer.owner(level, ChunkPos.pack(event.pos()));
+            if (owner != region) {
+                // A queued block event can outlive a topology change. Never
+                // resolve it through Level#getBlockState from the old owner:
+                // that can enter the synchronous chunk-load path and abort
+                // the entire region tick (leaving piston block entities at
+                // an intermediate progress value).
+                data.blockEvents().remove(event);
+                if (owner != null && !owner.isRetired()) {
+                    owner.execute(() -> {
+                        RegioniumRegion actualOwner = regionizer.owner(level, ChunkPos.pack(event.pos()));
+                        if (actualOwner == owner && !owner.isRetired()) {
+                            owner.worldData().pushBlockEvent(event);
+                        } else if (actualOwner != null) {
+                            deferBlockEvent(level, event);
+                        }
+                    });
+                }
+                continue;
+            }
+
+            var visible = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+                (Object) level.getChunkSource().chunkMap).regionium$getVisibleChunkMap();
+            var holder = visible.get(ChunkPos.pack(event.pos()));
+            var chunk = holder == null ? null : holder.getChunkIfPresent(
+                net.minecraft.world.level.chunk.status.ChunkStatus.FULL
+            );
+            if (!(chunk instanceof LevelChunk levelChunk)) {
+                // Chunk promotion/unload may race the region tick. Keep the
+                // event queued until its owning chunk is FULL again instead
+                // of forcing a synchronous load or losing the event.
+                continue;
+            }
+
+            var state = levelChunk.getBlockState(event.pos());
             if (state.is(event.block())
                 && state.triggerEvent(
                     level,
@@ -691,13 +843,35 @@ public final class RegioniumScheduler implements AutoCloseable {
         try {
             for (var ticker : List.copyOf(data.blockEntityTickers())) {
                 if (ticker.isRemoved()) {
+                    data.removeBlockEntityTicker(ticker);
+                    continue;
+                }
+
+                // Topology changes can assign a chunk to a different region
+                // while its ticker is still in the old region's list. Never
+                // tick it here; hand it off through the destination's task
+                // queue so only that region mutates its ticker lists.
+                var tickerPos = ticker.getPos();
+                RegioniumRegion owner = regionizer.owner(
+                    level,
+                    net.minecraft.world.level.ChunkPos.containing(tickerPos).pack()
+                );
+                if (owner != current) {
+                    data.removeBlockEntityTicker(ticker);
+                    if (owner != null && !owner.isRetired()) {
+                        owner.execute(() -> {
+                            if (!ticker.isRemoved()
+                                && regionizer.owner(level, net.minecraft.world.level.ChunkPos.containing(ticker.getPos()).pack()) == owner) {
+                                owner.worldData().addBlockEntityTicker(ticker);
+                            }
+                        });
+                    }
                     continue;
                 }
 
                 // Block-entity state is part of the chunk save snapshot. The
                 // save path uses the same LevelChunk monitor, so ticking must
                 // hold it for the complete block-entity mutation as well.
-                var tickerPos = ticker.getPos();
                 var chunk = data.chunks().stream()
                     .filter(candidate -> candidate.getPos().equals(net.minecraft.world.level.ChunkPos.containing(tickerPos)))
                     .findFirst()
@@ -706,14 +880,36 @@ public final class RegioniumScheduler implements AutoCloseable {
                     continue;
                 }
 
-                synchronized (chunk) {
-                    if (!ticker.isRemoved()) {
-                        ticker.tick();
+                long chunkKey = chunk.getPos().pack();
+                beginChunkExecution(level, chunkKey);
+                try {
+                    synchronized (chunk) {
+                        // Unload maintenance must not detach this chunk while
+                        // its block entity is midway through a multi-step tick.
+                        if (!ticker.isRemoved()
+                            && regionizer.owner(level, chunkKey) == current) {
+                            ticker.tick();
+                        }
                     }
+                } finally {
+                    endChunkExecution(level, chunkKey);
                 }
             }
         } finally {
             data.setTickingBlockEntities(false);
+        }
+    }
+
+    private record NeighborUpdateKey(ServerLevel level, long chunkPos) {
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof NeighborUpdateKey key
+                && key.level == level && key.chunkPos == chunkPos;
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * System.identityHashCode(level) + Long.hashCode(chunkPos);
         }
     }
 
@@ -805,15 +1001,42 @@ public final class RegioniumScheduler implements AutoCloseable {
             return;
         }
 
+        // stopServer() runs before vanilla saves chunks. Region ticks must be
+        // quiescent before that save begins; interrupting a tick can leave a
+        // multi-step block update (for example a moving piston) half-applied.
         running.set(false);
-        for (RegioniumRegion region : regionizer.allRegions()) {
+        List<RegioniumRegion> regionsToStop = regionizer.allRegions();
+        for (RegioniumRegion region : regionsToStop) {
             region.requestStop();
         }
-        synchronized (levelRegions) {
-            levelRegions.clear();
-        }
 
-        workers.shutdownNow();
+        // cancel(false) in requestStop prevents future periodic executions but
+        // lets an already-running tick reach its finally block. shutdown(),
+        // unlike shutdownNow(), preserves that guarantee.
+        for (ScheduledThreadPoolExecutor worker : workers) {
+            worker.shutdown();
+        }
+        boolean interrupted = false;
+        try {
+            for (ScheduledThreadPoolExecutor worker : workers) {
+                while (!worker.isTerminated()) {
+                    try {
+                        worker.awaitTermination(1L, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        // Do not let a shutdown interrupt corrupt world state.
+                        // Restore the interrupt flag after all active ticks finish.
+                        interrupted = true;
+                    }
+                }
+            }
+        } finally {
+            synchronized (levelRegions) {
+                levelRegions.clear();
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private void tickRegion(RegioniumRegion region) {

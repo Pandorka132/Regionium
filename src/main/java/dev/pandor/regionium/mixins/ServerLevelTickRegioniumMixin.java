@@ -106,27 +106,19 @@ public abstract class ServerLevelTickRegioniumMixin {
             return;
         }
 
-        ServerLevel level = (ServerLevel) (Object) this;
-        var region = RegioniumContext.requireRegionThread();
-        var data = Regionium.scheduler().worldData(level);
-        data.setRedstoneTime(region, data.redstoneTime(region) + 1L);
+        // Vanilla advances the world's game time once on the server thread.
+        // Region workers must not advance a separate clock: scheduled tick
+        // deadlines are persisted in the vanilla world-time domain.
         ci.cancel();
     }
 
     /**
-     * LevelAccessor#createTick() uses getGameTime() when it creates scheduled
-     * block/fluid ticks. On a region worker that must be the region's
-     * redstone clock, not the shared ServerLevel clock.
+     * Vanilla scheduled ticks store their trigger time in the world's game-time
+     * domain, and that timestamp is serialized with the chunk. Keep the same
+     * clock on region workers so a saved tick remains valid after unload,
+     * reload, or reassignment to another region.
      */
     public long getGameTime() {
-        if (RegioniumContext.isRegionThread()) {
-            var region = RegioniumContext.currentRegion();
-            if (region != null) {
-                ServerLevel level = (ServerLevel) (Object) this;
-                return Regionium.scheduler().worldData(level).redstoneTime(region);
-            }
-        }
-
         return ((net.minecraft.world.level.storage.LevelData)
             ((ServerLevel) (Object) this).getLevelData()).getGameTime();
     }

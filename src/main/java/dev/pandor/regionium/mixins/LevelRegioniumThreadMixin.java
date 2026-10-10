@@ -65,12 +65,41 @@ public abstract class LevelRegioniumThreadMixin {
         net.minecraft.world.level.block.entity.TickingBlockEntity ticker,
         CallbackInfo ci
     ) {
-        if (!RegioniumContext.isRegionThread() || !((Object) this instanceof net.minecraft.server.level.ServerLevel level)) {
+        if (!((Object) this instanceof net.minecraft.server.level.ServerLevel level)) {
             return;
         }
 
-        var region = RegioniumContext.requireRegionThread();
-        Regionium.scheduler().worldData(level).addBlockEntityTicker(ticker);
-        ci.cancel();
+        var owner = Regionium.scheduler().regionizer().owner(
+            level,
+            net.minecraft.world.level.ChunkPos.containing(ticker.getPos()).pack()
+        );
+        if (owner == null) {
+            // Chunk lifecycle can register its tickers before Regionium has
+            // published an owner. Leave vanilla's wrapper intact; addChunk()
+            // will adopt it from LevelChunk.tickersInLevel when ownership is
+            // established.
+            return;
+        }
+
+        var current = RegioniumContext.isRegionThread()
+            ? RegioniumContext.currentRegion()
+            : null;
+        if (owner == current) {
+            owner.worldData().addBlockEntityTicker(ticker);
+            ci.cancel();
+            return;
+        }
+
+        if (!owner.isRetired() && owner.execute(() -> {
+            if (!ticker.isRemoved()
+                && Regionium.scheduler().regionizer().owner(
+                    level,
+                    net.minecraft.world.level.ChunkPos.containing(ticker.getPos()).pack()
+                ) == owner) {
+                owner.worldData().addBlockEntityTicker(ticker);
+            }
+        })) {
+            ci.cancel();
+        }
     }
 }

@@ -34,6 +34,7 @@ public abstract class MinecraftServerLevelRegioniumMixin {
         // global-region tick. The region-local ServerLevel.tickTime() only
         // advances its redstone clock.
         Regionium.scheduler().tickGlobalTime(level);
+        Regionium.scheduler().tickGlobalWeather(level);
 
         // Folia's global region processes chunk lifecycle/ticket work even
         // when no simulation region is active yet. This is what allows
@@ -41,7 +42,11 @@ public abstract class MinecraftServerLevelRegioniumMixin {
         // chunks before the owning region can execute them.
         level.getChunkSource().tick(haveTime, false);
 
-        Regionium.scheduler().regionizer().markTopologyDirty(level);
+        // Topology is event-driven: ChunkHolder add/remove/lifecycle callbacks
+        // mark it dirty. Re-marking it every global tick forces rebalance() to
+        // queue for the regionizer's global write lock even when no chunk or
+        // region boundary changed. A single slow region then stalls every other
+        // region behind the fair tick barrier.
         ((ServerLevelEntityManagerAccessorMixin) (Object) level)
             .regionium$getEntityManager().tick();
         Regionium.scheduler().prepareChunkExecution(level);

@@ -4,6 +4,8 @@ import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.waypoints.ServerWaypointManager;
+import net.minecraft.world.waypoints.Waypoint;
+import net.minecraft.world.waypoints.WaypointTransmitter;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -31,6 +33,26 @@ public abstract class ServerWaypointManagerRegioniumMixin {
     ) {
         if (RegioniumContext.isRegionThread()) {
             Regionium.scheduler().queueWaypointPlayerUpdate(player);
+            ci.cancel();
+        }
+    }
+
+    @Inject(method = "updateWaypoint(Lnet/minecraft/world/waypoints/WaypointTransmitter;)V", at = @At("HEAD"), cancellable = true)
+    private void regionium$skipTransmitterUpdateFromRegionThread(
+        WaypointTransmitter transmitter,
+        CallbackInfo ci
+    ) {
+        if (RegioniumContext.isRegionThread()) {
+            ci.cancel();
+        }
+    }
+
+    @Inject(method = "updateWaypoint(Lnet/minecraft/world/waypoints/Waypoint;)V", at = @At("HEAD"), cancellable = true)
+    private void regionium$skipWaypointUpdateFromRegionThread(
+        Waypoint waypoint,
+        CallbackInfo ci
+    ) {
+        if (RegioniumContext.isRegionThread()) {
             ci.cancel();
         }
     }

@@ -2,12 +2,12 @@ package dev.pandor.regionium.gametest;
 
 import dev.pandor.regionium.Regionium;
 import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.block.Blocks;
 import dev.pandor.regionium.core.RegioniumRegion;
 import net.fabricmc.fabric.api.gametest.v1.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.block.Blocks;
 
 public final class CarpetPlayerGameTests {
     private static final String DISTANT_A = "RegioniumDistantA";
@@ -244,6 +244,14 @@ public final class CarpetPlayerGameTests {
                         "One region stopped ticking: deltaA=" + deltaA + ", deltaB=" + deltaB);
                 }
 
+                if (!workerThreads[0].equals(regionA.lastWorkerThreadName())
+                    || !workerThreads[1].equals(regionB.lastWorkerThreadName())) {
+                    throw helper.assertionException(
+                        "Region worker affinity changed: A " + workerThreads[0] + " -> "
+                            + regionA.lastWorkerThreadName() + ", B " + workerThreads[1] + " -> "
+                            + regionB.lastWorkerThreadName());
+                }
+
                 long failuresA = regionA.tickFailures();
                 long failuresB = regionB.tickFailures();
                 if (failuresA != 0 || failuresB != 0) {
@@ -281,7 +289,9 @@ public final class CarpetPlayerGameTests {
     ) {
         if (regionA == null || regionB == null) {
             throw helper.assertionException(
-                "A player has no Regionium owner: A=" + regionA + ", B=" + regionB);
+                "A player has no Regionium owner: A=" + regionA + ", B=" + regionB
+                    + ", A chunk=" + chunkLifecycle(helper.getLevel(), a.blockPosition())
+                    + ", B chunk=" + chunkLifecycle(helper.getLevel(), b.blockPosition()));
         }
 
         if (regionA == regionB) {
@@ -289,6 +299,21 @@ public final class CarpetPlayerGameTests {
                 "Distant Carpet players were placed in the same region: region="
                     + regionA.id() + ", A=" + a.position() + ", B=" + b.position());
         }
+    }
+
+    private static String chunkLifecycle(
+        net.minecraft.server.level.ServerLevel level,
+        BlockPos pos
+    ) {
+        long key = net.minecraft.world.level.ChunkPos.pack(pos);
+        var visible = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+            (Object) level.getChunkSource().chunkMap).regionium$getVisibleChunkMap();
+        var holder = visible.get(key);
+        return "pos=" + pos + ", owner=" + Regionium.scheduler().regionizer().owner(level, key)
+            + ", holder=" + (holder == null ? "null" : "ticket=" + holder.getTicketLevel()
+                + "/ticking=" + (holder.getTickingChunk() != null)
+                + "/entityTicking=" + (holder.getEntityTickingChunkFuture()
+                    .getNow(net.minecraft.server.level.ChunkHolder.UNLOADED_LEVEL_CHUNK).orElse(null) != null));
     }
 
     private static ServerPlayer requirePlayer(GameTestHelper helper, String name) {
@@ -323,6 +348,8 @@ public final class CarpetPlayerGameTests {
                 killBot(helper, "RegioniumRoundTripA");
                 killBot(helper, "RegioniumRoundTripB");
                 runCommand(helper, "carpet allowSpawningOfflinePlayers true");
+                runCommand(helper, "forceload add 16384 0");
+                runCommand(helper, "forceload add 17664 0");
                 spawnPairAt(helper, "RegioniumRoundTripA", "RegioniumRoundTripB", 16384);
             })
             .thenIdle(100)
@@ -349,7 +376,11 @@ public final class CarpetPlayerGameTests {
                     Regionium.scheduler().regionizer().regionFor(b));
                 assertNoTickFailures(helper);
             })
-            .thenExecute(() -> cleanupPair(helper, "RegioniumRoundTripA", "RegioniumRoundTripB"))
+            .thenExecute(() -> {
+                cleanupPair(helper, "RegioniumRoundTripA", "RegioniumRoundTripB");
+                runCommand(helper, "forceload remove 16384 0");
+                runCommand(helper, "forceload remove 17664 0");
+            })
             .thenSucceed();
     }
 
@@ -382,7 +413,10 @@ public final class CarpetPlayerGameTests {
                     throw helper.assertionException("Remaining region invalid after chunk unload churn");
                 }
             })
-            .thenExecute(() -> runCommand(helper, "player RegioniumChurnB spawn at 21760 80 0"))
+            .thenExecute(() -> {
+                runCommand(helper, "player RegioniumChurnB spawn at 21760 80 0");
+                runCommand(helper, "forceload add 21760 0");
+            })
             .thenIdle(100)
             .thenExecute(() -> {
                 ServerPlayer a = requirePlayer(helper, "RegioniumChurnA");
@@ -392,7 +426,10 @@ public final class CarpetPlayerGameTests {
                     Regionium.scheduler().regionizer().regionFor(b));
                 assertNoTickFailures(helper);
             })
-            .thenExecute(() -> cleanupPair(helper, "RegioniumChurnA", "RegioniumChurnB"))
+            .thenExecute(() -> {
+                cleanupPair(helper, "RegioniumChurnA", "RegioniumChurnB");
+                runCommand(helper, "forceload remove 21760 0");
+            })
             .thenSucceed();
     }
 

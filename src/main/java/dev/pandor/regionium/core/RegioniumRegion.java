@@ -17,11 +17,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * A Folia-style schedulable region.
  *
  * A region is not a worker thread. It is a unit of world ownership which is
- * scheduled onto a shared worker pool. Its RegioniumWorldData is the complete
+ * scheduled onto its assigned single-thread worker. Its RegioniumWorldData is the complete
  * mutable world state owned by this region.
  */
 public final class RegioniumRegion {
     private static final long TICK_NANOS = TimeUnit.SECONDS.toNanos(1) / 20L;
+    private static final long LAG_WARNING_THRESHOLD_NANOS = TimeUnit.SECONDS.toNanos(2L);
+    private static final long LAG_WARNING_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(2L);
 
     private final long id;
     private final ServerLevel level;
@@ -36,7 +38,10 @@ public final class RegioniumRegion {
 
     private volatile ScheduledFuture<?> scheduledTask;
     private volatile Runnable tickBody = () -> {};
+    private volatile boolean tickLoopEnabled;
     private volatile String lastWorkerThreadName = "<not ticked yet>";
+    private volatile long nextTickDeadlineNanos;
+    private volatile long lastLagWarningNanos;
 
     RegioniumRegion(long id, ServerLevel level, ScheduledThreadPoolExecutor scheduler) {
         this.id = id;
@@ -94,19 +99,25 @@ public final class RegioniumRegion {
             return;
         }
 
-        scheduledTask = scheduler.scheduleAtFixedRate(
-            this::runTick,
-            0L,
-            TICK_NANOS,
-            TimeUnit.NANOSECONDS
-        );
+        tickLoopEnabled = true;
+        nextTickDeadlineNanos = System.nanoTime();
+        // A periodic fixed-rate task tries to execute every missed invocation
+        // after a long tick, creating a burst of catch-up ticks. Folia advances
+        // its deadline past missed periods instead. Regionium schedules the next
+        // invocation from runTick() and drops overruns rather than replaying them.
+        scheduledTask = scheduler.schedule(this::runTick, 0L, TimeUnit.NANOSECONDS);
     }
 
     void runTickForGameTest() {
         runTick();
     }
 
-    void stopScheduledTickLoop() {
+    java.util.concurrent.Future<?> submitGameTestTick() {
+        return scheduler.submit(this::runTickForGameTest);
+    }
+
+    synchronized void stopScheduledTickLoop() {
+        tickLoopEnabled = false;
         ScheduledFuture<?> future = scheduledTask;
         if (future != null) {
             future.cancel(false);
@@ -155,6 +166,8 @@ public final class RegioniumRegion {
         }
 
         lastWorkerThreadName = Thread.currentThread().getName();
+        long tickStartNanos = System.nanoTime();
+        long scheduledStartNanos = nextTickDeadlineNanos;
         long tick = tickCount.incrementAndGet();
         boolean regionLockEntered = false;
         boolean contextEntered = false;
@@ -215,6 +228,44 @@ public final class RegioniumRegion {
                 Regionium.scheduler().regionizer().exitRegionTick();
             }
             ticking.set(false);
+
+            // Folia-style deadline advancement: account for both scheduler
+            // lateness and work that exceeded the 50 ms budget, but never
+            // replay every missed fixed-rate tick.
+            long tickEndNanos = System.nanoTime();
+            long expectedEndNanos = scheduledStartNanos + TICK_NANOS;
+            long behindNanos = Math.max(
+                Math.max(0L, tickStartNanos - scheduledStartNanos),
+                Math.max(0L, tickEndNanos - expectedEndNanos)
+            );
+            if (!Regionium.scheduler().isGameTestDriven()
+                && behindNanos >= LAG_WARNING_THRESHOLD_NANOS
+                && tickEndNanos - lastLagWarningNanos >= LAG_WARNING_INTERVAL_NANOS) {
+                lastLagWarningNanos = tickEndNanos;
+                long behindMillis = TimeUnit.NANOSECONDS.toMillis(behindNanos);
+                Regionium.LOGGER.warn(
+                    "Region {} can't keep up! Is the server overloaded? Running {}ms or {} ticks behind",
+                    id,
+                    behindMillis,
+                    behindNanos / TICK_NANOS
+                );
+            }
+
+            synchronized (this) {
+                if (tickLoopEnabled && !retired.get()
+                    && !Regionium.scheduler().isGameTestDriven()) {
+                    long nextDeadline = Math.max(expectedEndNanos, tickEndNanos);
+                    nextTickDeadlineNanos = nextDeadline;
+                    long delay = Math.max(0L, nextDeadline - tickEndNanos);
+                    scheduledTask = scheduler.schedule(
+                        this::runTick,
+                        delay,
+                        TimeUnit.NANOSECONDS
+                    );
+                } else {
+                    scheduledTask = null;
+                }
+            }
         }
 
     }
