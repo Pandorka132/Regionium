@@ -11,4 +11,4 @@ fi
 
 VERSION=${1:?Usage: scripts/release.sh <version>}
 sed -i "s/0.0-SNAPSHOT/${VERSION}/" gradle.properties
-./gradlew runDatagen runGameTestServer buildAndCollect publishModrinth --stacktrace
+./gradlew runDatagen runGameTestServer buildAndCollect publishModrinth -Pregionium.carpetTests --stacktrace
