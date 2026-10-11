@@ -184,13 +184,9 @@ public final class RegioniumRegion {
                 }
             }
 
-            // PacketProcessor is the ownership queue for ServerGamePacketListenerImpl.
-            // Network threads only enqueue here; the owning region must execute the
-            // queued packet before its world tick. Without this drain, packets sent
-            // after a region transfer remain queued forever, making the client appear
-            // dead (no movement/input, gamemode changes, block interaction, etc.).
-            Regionium.scheduler().drainRegionPackets(this);
-
+            // Packet processing is performed by tickRegion() through
+            // drainPacketsForRegion(), which checks ownership after every packet
+            // and migrates the player before the next queued packet can execute.
             runTasks();
             tickBody.run();
         } catch (Throwable error) {

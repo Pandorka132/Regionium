@@ -5,12 +5,10 @@ import dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess;
 import net.minecraft.network.PacketListener;
 import net.minecraft.network.PacketProcessor;
 import net.minecraft.network.protocol.Packet;
-import net.minecraft.network.protocol.game.ClientboundBlockEventPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.level.BlockEventData;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.ticks.LevelTicks;
@@ -60,13 +58,6 @@ public final class RegioniumScheduler implements AutoCloseable {
     private final PacketProcessor globalPacketProcessor = new PacketProcessor(null);
     private final Set<ChunkExecutionKey> activeChunkExecutions =
         ConcurrentHashMap.newKeySet();
-    private final ConcurrentMap<ChunkExecutionKey, AtomicInteger> queuedNeighborExecutions =
-        new ConcurrentHashMap<>();
-    // Neighbor callbacks are normally synchronous in vanilla. Region ownership
-    // requires cross-region dispatch, so retain callbacks until their target
-    // chunk is owned and loaded instead of silently discarding them on unload.
-    private final ConcurrentMap<NeighborUpdateKey, ConcurrentLinkedQueue<Runnable>> deferredNeighborUpdates =
-        new ConcurrentHashMap<>();
     // Scheduled ticks can be produced while a chunk has a spatial region
     // owner but its LevelChunkTicks containers have not yet been attached to
     // that region's LevelTicks. Keep those ticks until addChunk() registers
@@ -174,35 +165,15 @@ public final class RegioniumScheduler implements AutoCloseable {
     }
 
     /**
-     * Execute all packets currently queued for players owned by this region.
-     * PacketProcessor itself is the queue; the network thread never executes
-     * world-mutating packet handlers.
+     * Execute queued packets through the same ownership-checked path used by
+     * the region tick. Ownership can change while a movement packet executes,
+     * so every subsequent packet must re-check the player's owner.
      */
     public void drainRegionPackets(RegioniumRegion region) {
         if (RegioniumContext.currentRegion() != region) {
             throw new IllegalStateException("Packet drain outside owning region");
         }
-
-        for (ServerPlayer player : List.copyOf(region.worldData().players())) {
-            if (player.isRemoved()) {
-                continue;
-            }
-
-            if (regionizer.owner(region.level(), player.chunkPosition().pack()) != region) {
-                regionizer.migrateEntityAfterRegionAction(region.level(), player);
-                continue;
-            }
-
-            var access = (ServerPlayerRegioniumPacketAccess) (Object) player;
-            var processor = (dev.pandor.regionium.access.PacketProcessorRegioniumAccess)
-                (Object) access.regionium$getPacketProcessor();
-
-            while (processor.regionium$hasPackets()) {
-                if (!processor.regionium$executeSinglePacket()) {
-                    break;
-                }
-            }
-        }
+        drainPacketsForRegion(region);
     }
 
     public boolean isOwnedByCurrentRegion(Object object) {
@@ -598,86 +569,6 @@ public final class RegioniumScheduler implements AutoCloseable {
         return Set.copyOf(worldData(level).entities());
     }
 
-    public void dispatchNeighborUpdate(ServerLevel level, long chunkPos, Runnable operation) {
-        Objects.requireNonNull(level, "level");
-        Objects.requireNonNull(operation, "operation");
-        RegioniumRegion owner = regionizer.owner(level, chunkPos);
-        if (owner == null || owner.isRetired()) {
-            deferNeighborUpdate(level, chunkPos, operation);
-            return;
-        }
-
-        if (RegioniumContext.currentRegion() == owner) {
-            if (owner.worldData().hasChunk(chunkPos)) {
-                operation.run();
-            } else {
-                deferNeighborUpdate(level, chunkPos, operation);
-            }
-            return;
-        }
-
-        // A queued callback is part of the target chunk's in-flight update.
-        // Pin it against ChunkMap.processUnloads until the owning region has
-        // either completed the callback or safely deferred it for a reload.
-        beginQueuedNeighborExecution(level, chunkPos);
-        boolean accepted = owner.execute(() -> {
-            try {
-                RegioniumRegion actualOwner = regionizer.owner(level, chunkPos);
-                if (actualOwner == null || actualOwner.isRetired()
-                    || !actualOwner.worldData().hasChunk(chunkPos)) {
-                    deferNeighborUpdate(level, chunkPos, operation);
-                    return;
-                }
-                if (actualOwner != owner) {
-                    dispatchNeighborUpdate(level, chunkPos, operation);
-                    return;
-                }
-                operation.run();
-            } finally {
-                endQueuedNeighborExecution(level, chunkPos);
-            }
-        });
-        if (!accepted) {
-            endQueuedNeighborExecution(level, chunkPos);
-            deferNeighborUpdate(level, chunkPos, operation);
-        }
-    }
-
-    private void beginQueuedNeighborExecution(ServerLevel level, long chunkPos) {
-        queuedNeighborExecutions.computeIfAbsent(
-            new ChunkExecutionKey(level, chunkPos), ignored -> new AtomicInteger()
-        ).incrementAndGet();
-    }
-
-    private void endQueuedNeighborExecution(ServerLevel level, long chunkPos) {
-        ChunkExecutionKey key = new ChunkExecutionKey(level, chunkPos);
-        queuedNeighborExecutions.computeIfPresent(key, (ignored, count) ->
-            count.decrementAndGet() <= 0 ? null : count
-        );
-    }
-
-    private void deferNeighborUpdate(ServerLevel level, long chunkPos, Runnable operation) {
-        deferredNeighborUpdates.computeIfAbsent(
-            new NeighborUpdateKey(level, chunkPos), ignored -> new ConcurrentLinkedQueue<>()
-        ).offer(operation);
-    }
-
-    public void flushDeferredNeighborUpdates(ServerLevel level, long chunkPos, RegioniumRegion owner) {
-        if (RegioniumContext.currentRegion() != owner || owner.isRetired()
-            || regionizer.owner(level, chunkPos) != owner || !owner.worldData().hasChunk(chunkPos)) {
-            return;
-        }
-        NeighborUpdateKey key = new NeighborUpdateKey(level, chunkPos);
-        ConcurrentLinkedQueue<Runnable> pending = deferredNeighborUpdates.remove(key);
-        if (pending == null) {
-            return;
-        }
-        Runnable operation;
-        while ((operation = pending.poll()) != null) {
-            operation.run();
-        }
-    }
-
     public void prepareChunkExecution(ServerLevel level) {
         registerLevel(level);
         regionizer.rebalance(level);
@@ -713,9 +604,7 @@ public final class RegioniumScheduler implements AutoCloseable {
     }
 
     public boolean isChunkExecutionActive(ServerLevel level, long chunkPos) {
-        ChunkExecutionKey key = new ChunkExecutionKey(level, chunkPos);
-        AtomicInteger queued = queuedNeighborExecutions.get(key);
-        return activeChunkExecutions.contains(key) || (queued != null && queued.get() > 0);
+        return activeChunkExecutions.contains(new ChunkExecutionKey(level, chunkPos));
     }
 
     public void deferScheduledTick(Object levelTicks, net.minecraft.world.ticks.ScheduledTick<?> tick) {
@@ -777,98 +666,6 @@ public final class RegioniumScheduler implements AutoCloseable {
             action.run();
         } else {
             region.execute(action);
-        }
-    }
-
-    public void deferBlockEvent(ServerLevel level, BlockEventData event) {
-        RegioniumRegion current = RegioniumContext.currentRegion();
-        RegioniumRegion target = regionizer.owner(level, ChunkPos.pack(event.pos()));
-
-        if (current == target && current != null) {
-            current.worldData().pushBlockEvent(event);
-            return;
-        }
-
-        if (target != null && !target.isRetired()) {
-            target.execute(() -> {
-                // Ownership may change between selecting the destination and
-                // executing this task. Re-route rather than placing the event
-                // into a stale region's queue.
-                RegioniumRegion actualOwner = regionizer.owner(level, ChunkPos.pack(event.pos()));
-                if (actualOwner == target && !target.isRetired()) {
-                    target.worldData().pushBlockEvent(event);
-                } else if (actualOwner != null) {
-                    deferBlockEvent(level, event);
-                }
-            });
-        }
-    }
-
-    public void dispatchBlockEventsForRegion(ServerLevel level, RegioniumRegion region) {
-        RegioniumWorldData data = region.worldData();
-        if (RegioniumContext.currentRegion() != region) {
-            return;
-        }
-
-        for (BlockEventData event : List.copyOf(data.blockEvents())) {
-            RegioniumRegion owner = regionizer.owner(level, ChunkPos.pack(event.pos()));
-            if (owner != region) {
-                // A queued block event can outlive a topology change. Never
-                // resolve it through Level#getBlockState from the old owner:
-                // that can enter the synchronous chunk-load path and abort
-                // the entire region tick (leaving piston block entities at
-                // an intermediate progress value).
-                data.blockEvents().remove(event);
-                if (owner != null && !owner.isRetired()) {
-                    owner.execute(() -> {
-                        RegioniumRegion actualOwner = regionizer.owner(level, ChunkPos.pack(event.pos()));
-                        if (actualOwner == owner && !owner.isRetired()) {
-                            owner.worldData().pushBlockEvent(event);
-                        } else if (actualOwner != null) {
-                            deferBlockEvent(level, event);
-                        }
-                    });
-                }
-                continue;
-            }
-
-            var visible = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
-                (Object) level.getChunkSource().chunkMap).regionium$getVisibleChunkMap();
-            var holder = visible.get(ChunkPos.pack(event.pos()));
-            var chunk = holder == null ? null : holder.getChunkIfPresent(
-                net.minecraft.world.level.chunk.status.ChunkStatus.FULL
-            );
-            if (!(chunk instanceof LevelChunk levelChunk)) {
-                // Chunk promotion/unload may race the region tick. Keep the
-                // event queued until its owning chunk is FULL again instead
-                // of forcing a synchronous load or losing the event.
-                continue;
-            }
-
-            var state = levelChunk.getBlockState(event.pos());
-            if (state.is(event.block())
-                && state.triggerEvent(
-                    level,
-                    event.pos(),
-                    event.paramA(),
-                    event.paramB()
-                )) {
-                level.getServer().getPlayerList().broadcast(
-                    null,
-                    event.pos().getX(),
-                    event.pos().getY(),
-                    event.pos().getZ(),
-                    64.0,
-                    level.dimension(),
-                    new ClientboundBlockEventPacket(
-                        event.pos(),
-                        event.block(),
-                        event.paramA(),
-                        event.paramB()
-                    )
-                );
-            }
-            data.blockEvents().remove(event);
         }
     }
 
@@ -953,19 +750,6 @@ public final class RegioniumScheduler implements AutoCloseable {
             }
         } finally {
             data.setTickingBlockEntities(false);
-        }
-    }
-
-    private record NeighborUpdateKey(ServerLevel level, long chunkPos) {
-        @Override
-        public boolean equals(Object other) {
-            return other instanceof NeighborUpdateKey key
-                && key.level == level && key.chunkPos == chunkPos;
-        }
-
-        @Override
-        public int hashCode() {
-            return 31 * System.identityHashCode(level) + Long.hashCode(chunkPos);
         }
     }
 

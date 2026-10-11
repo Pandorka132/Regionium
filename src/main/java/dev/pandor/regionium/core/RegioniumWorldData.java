@@ -7,13 +7,14 @@ import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.level.BlockEventData;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
-import net.minecraft.world.level.chunk.LevelChunk;
-import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
 import net.minecraft.world.level.redstone.NeighborUpdater;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.material.Fluid;
+import net.minecraft.world.level.BlockEventData;
+import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 import net.minecraft.world.ticks.LevelChunkTicks;
 import net.minecraft.world.ticks.LevelTicks;
 
@@ -40,9 +41,7 @@ public final class RegioniumWorldData {
         Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<LevelChunk> chunks =
         Collections.newSetFromMap(new IdentityHashMap<>());
-    // Neighbor-update ownership checks run in the redstone hot path. Keep a
-    // primitive chunk-key index so each check is O(1), not a scan of every
-    // LevelChunk in this region, and avoid boxing a Long per lookup.
+    // Primitive chunk-key index for O(1) chunk ownership checks.
     private final LongSet chunkPositions = new LongOpenHashSet();
     private final Set<LevelChunk> tickingChunks =
         Collections.newSetFromMap(new IdentityHashMap<>());
@@ -57,8 +56,7 @@ public final class RegioniumWorldData {
     private final LevelTicks<Block> blockTicks;
     private final LevelTicks<Fluid> fluidTicks;
     private final NeighborUpdater neighborUpdater;
-
-    private final List<BlockEventData> blockEvents = new ArrayList<>();
+    private final ObjectLinkedOpenHashSet<BlockEventData> blockEvents = new ObjectLinkedOpenHashSet<>();
     private volatile boolean handlingTick;
     private volatile boolean tickingBlockEntities;
 
@@ -130,8 +128,40 @@ public final class RegioniumWorldData {
         return neighborUpdater;
     }
 
-    public List<BlockEventData> blockEvents() {
-        return blockEvents;
+    public void pushBlockEvent(BlockEventData event) {
+        if (RegioniumContext.currentRegion() != region
+            || !Regionium.scheduler().isCurrentRegionFor(level, event.pos())) {
+            throw new IllegalStateException(
+                "Cannot queue block event outside its owning region: " + event.pos()
+            );
+        }
+        blockEvents.add(event);
+    }
+
+    public void pushBlockEventDuringMigration(BlockEventData event) {
+        blockEvents.add(event);
+    }
+
+    public void pushBlockEvents(Iterable<BlockEventData> events) {
+        for (BlockEventData event : events) {
+            pushBlockEvent(event);
+        }
+    }
+
+    public BlockEventData removeFirstBlockEvent() {
+        while (!blockEvents.isEmpty()) {
+            BlockEventData event = blockEvents.removeFirst();
+            if (Regionium.scheduler().regionizer().owner(level, event.pos().getX() >> 4, event.pos().getZ() >> 4) == region) {
+                return event;
+            }
+        }
+        return null;
+    }
+
+    public List<BlockEventData> drainBlockEvents() {
+        List<BlockEventData> result = new ArrayList<>(blockEvents);
+        blockEvents.clear();
+        return result;
     }
 
     public boolean isHandlingTick() {
@@ -192,7 +222,6 @@ public final class RegioniumWorldData {
             for (TickingBlockEntity ticker : access.regionium$getTickersInLevel().values()) {
                 addBlockEntityTicker(ticker);
             }
-            Regionium.scheduler().flushDeferredNeighborUpdates(level, chunk.getPos().pack(), region);
         } catch (Throwable error) {
             Regionium.LOGGER.error(
                 "Failed to register chunk {} in region {}",
@@ -281,14 +310,6 @@ public final class RegioniumWorldData {
         pendingBlockEntityTickers.clear();
     }
 
-    public void pushBlockEvent(BlockEventData event) {
-        blockEvents.add(event);
-    }
-
-    public BlockEventData removeFirstBlockEvent() {
-        return blockEvents.isEmpty() ? null : blockEvents.removeFirst();
-    }
-
     public boolean hasEntity(Entity entity) {
         return entities.contains(entity);
     }
@@ -299,6 +320,10 @@ public final class RegioniumWorldData {
 
     public boolean hasChunk(long chunkPos) {
         return chunkPositions.contains(chunkPos);
+    }
+
+    public void removeBlockEvents(java.util.function.Predicate<BlockEventData> predicate) {
+        blockEvents.removeIf(predicate);
     }
 
     private boolean ownsChunk(long chunkPos) {
@@ -319,8 +344,6 @@ public final class RegioniumWorldData {
     public List<TickingBlockEntity> blockEntityTickers(RegioniumRegion ignored) { return blockEntityTickers; }
     public LevelTicks<Block> blockTicks(RegioniumRegion ignored) { return blockTicks; }
     public LevelTicks<Fluid> fluidTicks(RegioniumRegion ignored) { return fluidTicks; }
-    public NeighborUpdater neighborUpdater(RegioniumRegion ignored) { return neighborUpdater; }
-    public List<BlockEventData> deferredBlockEvents(RegioniumRegion ignored) { return blockEvents; }
 
     public void add(Entity entity, RegioniumRegion ignored) { add(entity); }
     public void remove(Entity entity, RegioniumRegion ignored) { remove(entity); }
