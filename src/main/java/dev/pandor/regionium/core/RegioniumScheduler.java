@@ -67,6 +67,14 @@ public final class RegioniumScheduler implements AutoCloseable {
     // chunk is owned and loaded instead of silently discarding them on unload.
     private final ConcurrentMap<NeighborUpdateKey, ConcurrentLinkedQueue<Runnable>> deferredNeighborUpdates =
         new ConcurrentHashMap<>();
+    // Scheduled ticks can be produced while a chunk has a spatial region
+    // owner but its LevelChunkTicks containers have not yet been attached to
+    // that region's LevelTicks. Keep those ticks until addChunk() registers
+    // the containers; otherwise vanilla logs that the position is not loaded
+    // and drops the scheduled tick.
+    private final ConcurrentMap<ChunkExecutionKey,
+        ConcurrentLinkedQueue<net.minecraft.world.ticks.ScheduledTick<?>>> deferredScheduledTicks =
+        new ConcurrentHashMap<>();
 
     /*
      * Vanilla's ChunkMap.move() is a global chunk-tracking operation. Region
@@ -75,9 +83,6 @@ public final class RegioniumScheduler implements AutoCloseable {
      * surrounding lazy/simulation chunks.
      */
     private final Set<ServerPlayer> pendingGlobalPlayerMoves =
-        ConcurrentHashMap.newKeySet();
-
-    private final Set<ServerPlayer> pendingWaypointPlayerUpdates =
         ConcurrentHashMap.newKeySet();
 
     private final AtomicBoolean running = new AtomicBoolean();
@@ -226,14 +231,6 @@ public final class RegioniumScheduler implements AutoCloseable {
             level.getChunkSource().move(player);
         }
 
-        for (ServerPlayer player : List.copyOf(pendingWaypointPlayerUpdates)) {
-            pendingWaypointPlayerUpdates.remove(player);
-            if (player.isRemoved() || !(player.level() instanceof ServerLevel level)) {
-                continue;
-            }
-            level.getWaypointManager().updatePlayer(player);
-        }
-
         /*
          * ChunkMap/DistanceManager maintenance is performed exactly once by
          * RegioniumServerTickMixin after all levels have been registered.
@@ -247,12 +244,6 @@ public final class RegioniumScheduler implements AutoCloseable {
     public void queueGlobalPlayerMove(ServerPlayer player) {
         if (!player.isRemoved()) {
             pendingGlobalPlayerMoves.add(player);
-        }
-    }
-
-    public void queueWaypointPlayerUpdate(ServerPlayer player) {
-        if (!player.isRemoved()) {
-            pendingWaypointPlayerUpdates.add(player);
         }
     }
 
@@ -463,40 +454,109 @@ public final class RegioniumScheduler implements AutoCloseable {
         ServerLevel level,
         net.minecraft.world.ticks.ScheduledTick<?> tick
     ) {
-        RegioniumRegion region = regionizer.owner(level, ChunkPos.pack(tick.pos()));
+        long chunkKey = ChunkPos.pack(tick.pos());
+        RegioniumRegion region = regionizer.owner(level, chunkKey);
+        RegioniumRegion current = RegioniumContext.currentRegion();
         if (region == null) {
+            // During chunk promotion the target may not have been published in
+            // the region topology yet. A region-generated tick must not fall
+            // through to a LevelTicks queue that has no container for it.
+            // Keep it until the chunk is assigned and registered; calls made
+            // outside a region retain vanilla's normal behavior.
+            if (current != null && current.level() == level) {
+                deferScheduledTick(level, chunkKey, tick);
+                return true;
+            }
             return false;
         }
 
-        if (RegioniumContext.currentRegion() == region) {
-            return false;
-        }
-
-        // ScheduledTick.triggerTick is serialized by vanilla in world game
-        // time. Do not translate it to a region-local clock: after chunk
-        // unload/reload or region reassignment, that timestamp would refer to
-        // a different epoch and a clock could remain stalled indefinitely.
-        long trigger = tick.triggerTick();
-
-        if (tick.type() instanceof net.minecraft.world.level.block.Block block) {
-            region.worldData().blockTicks().schedule(
-                new net.minecraft.world.ticks.ScheduledTick<>(
-                    block, tick.pos(), trigger, tick.priority(), tick.subTickOrder()
-                )
-            );
+        if (current == region) {
+            // The owner thread is the only thread allowed to inspect its
+            // mutable chunk set. A spatial owner may be published before the
+            // ticking LevelChunk and its LevelChunkTicks containers are ready.
+            if (region.worldData().hasChunk(chunkKey)) {
+                return false;
+            }
+            deferScheduledTick(level, chunkKey, tick);
             return true;
         }
 
-        if (tick.type() instanceof net.minecraft.world.level.material.Fluid fluid) {
-            region.worldData().fluidTicks().schedule(
-                new net.minecraft.world.ticks.ScheduledTick<>(
-                    fluid, tick.pos(), trigger, tick.priority(), tick.subTickOrder()
-                )
-            );
-            return true;
+        // A region's LevelTicks and its chunk containers are single-owner
+        // state. Never inspect or mutate the target region's mutable world data
+        // from a foreign thread; defer the decision to the owner worker.
+        boolean accepted = region.execute(() -> {
+            RegioniumRegion actualOwner = regionizer.owner(level, chunkKey);
+            if (actualOwner != region) {
+                if (actualOwner != null) {
+                    routeScheduledTick(level, tick);
+                }
+                return;
+            }
+            if (!region.worldData().hasChunk(chunkKey)) {
+                // Ownership can precede container registration during chunk
+                // promotion. Preserve the tick until addChunk() registers it.
+                deferScheduledTick(level, chunkKey, tick);
+                return;
+            }
+            scheduleTickInRegion(region, tick);
+        });
+
+        if (!accepted) {
+            RegioniumRegion actualOwner = regionizer.owner(level, chunkKey);
+            if (actualOwner != null && actualOwner != region) {
+                return routeScheduledTick(level, tick);
+            }
+            deferScheduledTick(level, chunkKey, tick);
+        }
+        return true;
+    }
+
+    private void deferScheduledTick(
+        ServerLevel level,
+        long chunkKey,
+        net.minecraft.world.ticks.ScheduledTick<?> tick
+    ) {
+        deferredScheduledTicks.computeIfAbsent(
+            new ChunkExecutionKey(level, chunkKey), ignored -> new ConcurrentLinkedQueue<>()
+        ).add(tick);
+    }
+
+    /** Called on the owner region thread immediately after its chunk containers are registered. */
+    public void flushDeferredScheduledTicks(ServerLevel level, long chunkKey, RegioniumRegion region) {
+        if (RegioniumContext.currentRegion() != region || !region.worldData().hasChunk(chunkKey)) {
+            return;
         }
 
-        return false;
+        ChunkExecutionKey key = new ChunkExecutionKey(level, chunkKey);
+        ConcurrentLinkedQueue<net.minecraft.world.ticks.ScheduledTick<?>> pending =
+            deferredScheduledTicks.remove(key);
+        if (pending == null) {
+            return;
+        }
+
+        net.minecraft.world.ticks.ScheduledTick<?> tick;
+        while ((tick = pending.poll()) != null) {
+            RegioniumRegion currentOwner = regionizer.owner(level, chunkKey);
+            if (currentOwner != region) {
+                if (currentOwner != null) {
+                    routeScheduledTick(level, tick);
+                }
+                continue;
+            }
+            scheduleTickInRegion(region, tick);
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void scheduleTickInRegion(
+        RegioniumRegion region,
+        net.minecraft.world.ticks.ScheduledTick<?> tick
+    ) {
+        if (tick.type() instanceof net.minecraft.world.level.block.Block) {
+            region.worldData().blockTicks().schedule((net.minecraft.world.ticks.ScheduledTick) tick);
+        } else if (tick.type() instanceof net.minecraft.world.level.material.Fluid) {
+            region.worldData().fluidTicks().schedule((net.minecraft.world.ticks.ScheduledTick) tick);
+        }
     }
 
     public void trackEntity(Entity entity) {
@@ -1081,7 +1141,6 @@ public final class RegioniumScheduler implements AutoCloseable {
             for (ServerPlayer player : List.copyOf(region.worldData().players())) {
                 ((ServerPlayerRegioniumPacketAccess) (Object) player)
                     .regionium$updateRegion(region.worldData());
-                queueGlobalPlayerMove(player);
             }
         }
     }
@@ -1174,7 +1233,6 @@ public final class RegioniumScheduler implements AutoCloseable {
                 continue;
             }
             player.connection.tick();
-            queueGlobalPlayerMove(player);
         }
     }
 }

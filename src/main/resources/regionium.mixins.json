@@ -43,8 +43,10 @@
     "CollectingNeighborUpdaterRegioniumShapeRoutingMixin",
     "NeighborUpdaterRegioniumCrossRegionMixin",
     "ServerLevelNeighborUpdaterRegioniumMixin",
+    "LevelNeighborShapeUpdaterRegioniumMixin",
     "ServerConnectionListenerRegioniumMixin",
-    "ServerWaypointManagerRegioniumMixin"
+    "ServerCommonPacketListenerRegioniumMixin",
+    "PlayerChunkSenderRegioniumMixin"
   ],
   "injectors": {
     "defaultRequire": 1

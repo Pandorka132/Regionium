@@ -181,6 +181,9 @@ public final class RegioniumWorldData {
 
             blockTicks.addContainer(chunk.getPos(), block);
             fluidTicks.addContainer(chunk.getPos(), fluid);
+            Regionium.scheduler().flushDeferredScheduledTicks(
+                level, chunk.getPos().pack(), region
+            );
 
             // The vanilla chunk owns the authoritative, rebindable ticker
             // wrappers. Reconcile them whenever a chunk enters a region so
