@@ -7,7 +7,19 @@ import net.fabricmc.fabric.api.gametest.v1.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.core.Direction;
+import net.minecraft.network.protocol.game.ServerboundAcceptTeleportationPacket;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.material.Fluids;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
 
 public final class CarpetPlayerGameTests {
     private static final String DISTANT_A = "RegioniumDistantA";
@@ -123,6 +135,194 @@ public final class CarpetPlayerGameTests {
                 }
             })
             .thenExecute(() -> cleanupPair(helper, TRANSFER_A, TRANSFER_B))
+            .thenSucceed();
+    }
+
+
+    /**
+     * Regression for failures that only appeared after several player transfers.
+     * Three A -> B -> A cycles force repeated region merge/split operations while
+     * block and fluid ticks are pending. A final real UseItemOn packet checks
+     * the packet queue, block placement, neighbour propagation, and piston event.
+     */
+    @GameTest(maxTicks = 1800)
+    public void repeatedTransfersPreserveTicksAndPacketWorldUpdates(GameTestHelper helper) {
+        final String moverName = "RegioniumRepeatMove";
+        final String anchorName = "RegioniumRepeatAnchor";
+        final int baseX = 16384;
+        final int destinationX = baseX + FAR_OFFSET;
+        final BlockPos lampPos = new BlockPos(destinationX + 8, 80, 0);
+        final BlockPos waterPos = new BlockPos(destinationX + 12, 80, 0);
+        final BlockPos waterFlowPos = waterPos.east();
+        final BlockPos pistonPos = new BlockPos(destinationX + 2, 80, 0);
+        final BlockPos redstoneSupportPos = pistonPos.west();
+        final BlockPos redstonePos = redstoneSupportPos;
+        final RegioniumRegion[] initialOwners = new RegioniumRegion[2];
+
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+
+        helper.startSequence()
+            .thenExecute(() -> {
+                killBot(helper, moverName);
+                killBot(helper, anchorName);
+                runCommand(helper, "carpet allowSpawningOfflinePlayers true");
+                spawnPairAt(helper, moverName, anchorName, baseX);
+            })
+            .thenWaitUntil(() -> waitForPairOwners(helper, moverName, anchorName))
+            .thenExecute(() -> {
+                preparePlatform(helper, baseX);
+                preparePlatform(helper, destinationX);
+            })
+            .thenWaitUntil(() -> waitForPlatforms(helper, baseX, destinationX))
+            .thenExecute(() -> {
+                teleportPlayer(helper, moverName, baseX);
+                teleportPlayer(helper, anchorName, destinationX);
+            })
+            .thenIdle(20)
+            .thenExecute(() -> {
+                ServerPlayer mover = requirePlayer(helper, moverName);
+                ServerPlayer anchor = requirePlayer(helper, anchorName);
+                initialOwners[0] = Regionium.scheduler().regionizer().regionFor(mover);
+                initialOwners[1] = Regionium.scheduler().regionizer().regionFor(anchor);
+                if (initialOwners[0] == null || initialOwners[1] == null || initialOwners[0] == initialOwners[1]) {
+                    throw helper.assertionException("Transfer test players did not begin in distinct regions");
+                }
+                if (Regionium.scheduler().regionizer().regionFor(anchor) == null) {
+                    throw helper.assertionException("Anchor has no region before tick setup");
+                }
+                Regionium.scheduler().execute(helper.getLevel(), lampPos, () -> {
+                    var level = helper.getLevel();
+                    level.setBlock(lampPos, Blocks.REDSTONE_LAMP.defaultBlockState()
+                        .setValue(BlockStateProperties.LIT, true), 3);
+                    level.scheduleTick(lampPos, Blocks.REDSTONE_LAMP, 500);
+                    level.setBlock(waterPos.below(), Blocks.STONE.defaultBlockState(), 3);
+                    level.setBlock(waterFlowPos.below(), Blocks.STONE.defaultBlockState(), 3);
+                    level.setBlock(waterPos.north().below(), Blocks.STONE.defaultBlockState(), 3);
+                    level.setBlock(waterPos.south().below(), Blocks.STONE.defaultBlockState(), 3);
+                    level.setBlock(waterPos.west().below(), Blocks.STONE.defaultBlockState(), 3);
+                    level.setBlock(waterPos, Blocks.WATER.defaultBlockState(), 3);
+                    level.scheduleTick(waterPos, Fluids.WATER, 500);
+                });
+            })
+            .thenExecute(() -> teleportPlayer(helper, moverName, destinationX))
+            .thenWaitUntil(() -> waitForSameOwner(helper, moverName, anchorName))
+            .thenIdle(120)
+            .thenExecute(() -> teleportPlayer(helper, moverName, baseX))
+            .thenWaitUntil(() -> waitForSeparateOwners(helper, moverName, anchorName))
+            .thenIdle(8)
+            .thenExecute(() -> assertRegionTopologyConsistent(helper))
+            .thenExecute(() -> teleportPlayer(helper, moverName, destinationX))
+            .thenWaitUntil(() -> waitForSameOwner(helper, moverName, anchorName))
+            .thenIdle(8)
+            .thenExecute(() -> teleportPlayer(helper, moverName, baseX))
+            .thenWaitUntil(() -> waitForSeparateOwners(helper, moverName, anchorName))
+            .thenIdle(8)
+            .thenExecute(() -> assertRegionTopologyConsistent(helper))
+            .thenExecute(() -> teleportPlayer(helper, moverName, destinationX))
+            .thenWaitUntil(() -> waitForSameOwner(helper, moverName, anchorName))
+            .thenIdle(8)
+            .thenExecute(() -> teleportPlayer(helper, moverName, baseX))
+            .thenWaitUntil(() -> waitForSeparateOwners(helper, moverName, anchorName))
+            .thenExecute(() -> assertRegionTopologyConsistent(helper))
+            .thenIdle(400)
+            .thenExecute(() -> {
+                if (helper.getLevel().getBlockState(lampPos).getValue(BlockStateProperties.LIT)) {
+                    throw helper.assertionException("Scheduled block tick was lost/delayed after repeated transfers: "
+                        + helper.getLevel().getBlockState(lampPos));
+                }
+                if (helper.getLevel().getFluidState(waterFlowPos).isEmpty()) {
+                    throw helper.assertionException("Scheduled fluid tick did not spread water after repeated transfers: "
+                        + "source=" + helper.getLevel().getFluidState(waterPos)
+                        + ", adjacent=" + helper.getLevel().getFluidState(waterFlowPos));
+                }
+            })
+            .thenExecute(() -> teleportPlayer(helper, moverName, destinationX))
+            .thenWaitUntil(() -> waitForSameOwner(helper, moverName, anchorName))
+            .thenExecute(() -> Regionium.scheduler().execute(helper.getLevel(), pistonPos, () -> {
+                var level = helper.getLevel();
+                level.setBlock(redstoneSupportPos.below(), Blocks.STONE.defaultBlockState(), 3);
+                level.setBlock(pistonPos.below(), Blocks.STONE.defaultBlockState(), 3);
+                level.setBlock(pistonPos, Blocks.PISTON.defaultBlockState()
+                    .setValue(BlockStateProperties.FACING, Direction.EAST), 3);
+
+                ServerPlayer mover = requirePlayer(helper, moverName);
+                mover.setGameMode(GameType.CREATIVE);
+                mover.getInventory().setSelectedSlot(0);
+                mover.getInventory().setItem(0, new ItemStack(Items.REDSTONE_BLOCK));
+                // Carpet fake connections do not receive the client's normal load-ack packet.
+                // Put the listener into the same ready state a real client reaches after loading.
+                for (int i = 0; i < 200 && !mover.connection.hasClientLoaded(); i++) {
+                    mover.connection.tickClientLoadTimeout();
+                }
+                if (!mover.connection.hasClientLoaded()) {
+                    throw helper.assertionException("Fake player's packet listener never reached client-loaded state");
+                }
+                var packetAccess = (dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) mover;
+                // Carpet's fake connection has no client to acknowledge the server teleport.
+                // Send the same acknowledgement a real client sends before interaction.
+                var listenerAccess = (dev.pandor.regionium.mixins.ServerGamePacketListenerRegioniumAccessorMixin)
+                    (Object) mover.connection;
+                packetAccess.regionium$schedulePacket(mover.connection, new ServerboundAcceptTeleportationPacket(
+                    listenerAccess.regionium$getAwaitingTeleport(), mover.getX(), mover.getY(), mover.getZ(),
+                    mover.getYRot(), mover.getXRot()
+                ));
+                packetAccess.regionium$schedulePacket(mover.connection, new ServerboundMovePlayerPacket.PosRot(
+                    mover.getX(), mover.getY(), mover.getZ(), mover.getYRot(), mover.getXRot(), true, false
+                ));
+                packetAccess.regionium$schedulePacket(mover.connection, new ServerboundUseItemOnPacket(
+                        InteractionHand.MAIN_HAND,
+                        new BlockHitResult(Vec3.atCenterOf(redstoneSupportPos.below()), Direction.UP,
+                            redstoneSupportPos.below(), false),
+                        0
+                    ));
+            }))
+            .thenWaitUntil(() -> {
+                if (!helper.getLevel().getBlockState(redstonePos).is(Blocks.REDSTONE_BLOCK)) {
+                    ServerPlayer mover = requirePlayer(helper, moverName);
+                    RegioniumRegion packetOwner = Regionium.scheduler().regionizer().regionFor(mover);
+                    var processor = ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) mover)
+                        .regionium$getPacketProcessor();
+                    boolean queued = ((dev.pandor.regionium.access.PacketProcessorRegioniumAccess) (Object) processor)
+                        .regionium$hasPackets();
+                    throw helper.assertionException("Queued ServerboundUseItemOnPacket did not place redstone: "
+                        + helper.getLevel().getBlockState(redstonePos)
+                        + ", owner=" + packetOwner
+                        + ", ownerHasPlayer=" + (packetOwner != null && packetOwner.worldData().players().contains(mover))
+                        + ", ownerHasEntity=" + (packetOwner != null && packetOwner.worldData().hasEntity(mover))
+                        + ", queuedPackets=" + queued
+                        + ", support=" + helper.getLevel().getBlockState(redstoneSupportPos.below())
+                        + ", piston=" + helper.getLevel().getBlockState(pistonPos)
+                        + ", hand=" + mover.getItemInHand(InteractionHand.MAIN_HAND)
+                        + ", inRange=" + mover.isWithinBlockInteractionRange(redstoneSupportPos.below(), 1.0)
+                        + ", moverPos=" + mover.position()
+                        + ", target=" + redstoneSupportPos.below()
+                        + ", clientLoaded=" + mover.connection.hasClientLoaded()
+                        + ", connection=" + mover.connection);
+                }
+            })
+            .thenIdle(5)
+            .thenExecute(() -> {
+                if (!helper.getLevel().getBlockState(pistonPos).getValue(BlockStateProperties.EXTENDED)) {
+                    throw helper.assertionException(
+                        "Block-placement packet placed redstone, but neighbour/block-event processing did not extend piston: "
+                            + helper.getLevel().getBlockState(pistonPos));
+                }
+            })
+            .thenExecute(() -> {
+                ServerPlayer mover = requirePlayer(helper, moverName);
+                RegioniumRegion owner = Regionium.scheduler().regionizer().regionFor(mover);
+                if (owner == null || owner != Regionium.scheduler().regionizer().regionFor(
+                    requirePlayer(helper, anchorName))) {
+                    throw helper.assertionException("Packet test lost destination-region ownership");
+                }
+                long memberships = Regionium.scheduler().regionizer().allRegions().stream()
+                    .filter(region -> region.worldData().hasEntity(mover)).count();
+                if (memberships != 1) {
+                    throw helper.assertionException("Invalid region membership after repeated transfers: " + memberships);
+                }
+                cleanupPair(helper, moverName, anchorName);
+            })
             .thenSucceed();
     }
 
@@ -266,6 +466,77 @@ public final class CarpetPlayerGameTests {
             })
             .thenExecute(() -> cleanupPair(helper, TICK_A, TICK_B))
             .thenSucceed();
+    }
+
+    private static void assertRegionTopologyConsistent(GameTestHelper helper) {
+        var regionizer = Regionium.scheduler().regionizer();
+        var active = regionizer.activeRegions(helper.getLevel());
+        for (RegioniumRegion region : regionizer.regions(helper.getLevel())) {
+            if (region.isRetired() || !active.contains(region)) {
+                throw helper.assertionException(
+                    "Region registry retained an inactive/retired region after transfer: id=" + region.id()
+                        + ", retired=" + region.isRetired()
+                        + ", active=" + active.contains(region)
+                );
+            }
+        }
+    }
+
+    private static void preparePlatform(GameTestHelper helper, int x) {
+        Regionium.scheduler().execute(helper.getLevel(), new BlockPos(x, 80, 0), () -> {
+            for (int dx = 0; dx <= 24; dx++) {
+                for (int z = 0; z <= 4; z++) {
+                    helper.getLevel().setBlock(
+                        new BlockPos(x + dx, 79, z),
+                        Blocks.STONE.defaultBlockState(),
+                        3
+                    );
+                }
+            }
+        });
+    }
+
+    private static void waitForPlatforms(GameTestHelper helper, int firstX, int secondX) {
+        if (!helper.getLevel().getBlockState(new BlockPos(firstX, 79, 0)).is(Blocks.STONE)
+            || !helper.getLevel().getBlockState(new BlockPos(secondX, 79, 0)).is(Blocks.STONE)) {
+            throw helper.assertionException("Waiting for transfer test platforms to be built");
+        }
+    }
+
+    private static void teleportPlayer(GameTestHelper helper, String name, int x) {
+        ServerPlayer player = requirePlayer(helper, name);
+        player.teleportTo(
+            helper.getLevel(), x, 80.0, 0.0, java.util.Set.of(),
+            player.getYRot(), player.getXRot(), true
+        );
+    }
+
+    private static void waitForSameOwner(GameTestHelper helper, String first, String second) {
+        ServerPlayer a = requirePlayer(helper, first);
+        ServerPlayer b = requirePlayer(helper, second);
+        RegioniumRegion ownerA = Regionium.scheduler().regionizer().regionFor(a);
+        RegioniumRegion ownerB = Regionium.scheduler().regionizer().regionFor(b);
+        if (ownerA == null || ownerB == null || ownerA != ownerB) {
+            throw helper.assertionException(
+                "Waiting for region merge: A=" + ownerA + ", B=" + ownerB
+                    + ", A chunk=" + chunkLifecycle(helper.getLevel(), a.blockPosition())
+                    + ", B chunk=" + chunkLifecycle(helper.getLevel(), b.blockPosition())
+            );
+        }
+    }
+
+    private static void waitForSeparateOwners(GameTestHelper helper, String first, String second) {
+        ServerPlayer a = requirePlayer(helper, first);
+        ServerPlayer b = requirePlayer(helper, second);
+        RegioniumRegion ownerA = Regionium.scheduler().regionizer().regionFor(a);
+        RegioniumRegion ownerB = Regionium.scheduler().regionizer().regionFor(b);
+        if (ownerA == null || ownerB == null || ownerA == ownerB) {
+            throw helper.assertionException(
+                "Waiting for region split: A=" + ownerA + ", B=" + ownerB
+                    + ", A chunk=" + chunkLifecycle(helper.getLevel(), a.blockPosition())
+                    + ", B chunk=" + chunkLifecycle(helper.getLevel(), b.blockPosition())
+            );
+        }
     }
 
     private static void spawnPairAt(

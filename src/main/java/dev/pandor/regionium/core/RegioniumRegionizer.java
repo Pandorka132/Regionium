@@ -7,6 +7,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.BlockEventData;
 import net.minecraft.world.level.chunk.LevelChunk;
 
 import java.util.ArrayDeque;
@@ -294,15 +295,17 @@ public final class RegioniumRegionizer {
         }
 
         if (currentSections.isEmpty()) {
-            for (RegioniumRegion region : state.regions) {
-                region.stopScheduledTickLoop();
-                migrateRegionState(region, null, Set.of());
-            }
-            // Publish complete ownership snapshots. Mutating a shared map
-            // with clear()/putAll() exposes a transient ownerless world to
-            // region workers performing optimistic reads.
+            // Publish the empty topology while the lifecycle write lock and
+            // region-tick barrier are held, then synchronously clear and retire
+            // every former region. Inactive regions must not retain ownership.
             state.chunkOwners = Map.of();
             state.active = Set.of();
+            for (RegioniumRegion region : List.copyOf(state.regions)) {
+                region.stopScheduledTickLoop();
+                migrateRegionState(region, state, Map.of());
+                region.requestStop();
+            }
+            state.regions.clear();
             return;
         }
 
@@ -345,17 +348,20 @@ public final class RegioniumRegionizer {
             }
         }
 
-        /*
-         * Region-local chunk lists are reconciled by each region on its next
-         * tick. The write side of regionTickBarrier above ensures no old-owner
-         * tick can still be running when this new ownership snapshot is
-         * published. Every tick checks ownership before ticking a chunk.
-         */
-
-        // Publish atomically: readers see either the old topology or the new
-        // topology, never the empty/partially copied map.
+        // Publish the next topology under the lifecycle write lock. The tick
+        // barrier is still held, so no region can observe this snapshot until
+        // every region-local container/entity has been moved to its new owner.
         state.chunkOwners = Map.copyOf(nextOwners);
         state.active = Set.copyOf(used);
+
+        for (RegioniumRegion region : List.copyOf(state.regions)) {
+            migrateRegionState(region, state, nextOwners);
+            if (!used.contains(region)) {
+                region.stopScheduledTickLoop();
+                region.requestStop();
+                state.regions.remove(region);
+            }
+        }
 
         // Match Folia's RegionCallbacks.onRegionActive/onRegionInactive: a
         // region is scheduled only after the regionizer has established its
@@ -801,19 +807,142 @@ public final class RegioniumRegionizer {
         return Set.copyOf(result);
     }
 
-    private static void migrateRegionState(
-        RegioniumRegion region,
-        RegioniumRegion ignored,
-        Set<Long> ignoredChunks
+    /**
+     * Migrates the mutable state of one region to the owner selected by the
+     * next topology. Called with both the region-tick barrier and lifecycle
+     * write lock held, so this is the equivalent of Folia's region split/merge
+     * callback: no old region can tick while its containers are rebound.
+     */
+    private void migrateRegionState(
+        RegioniumRegion source,
+        LevelState state,
+        Map<Long, RegioniumRegion> nextOwners
     ) {
-        for (Entity entity : List.copyOf(region.worldData().entities())) {
-            region.worldData().remove(entity);
+        RegioniumWorldData sourceData = source.worldData();
+
+        // Block events have positions but are not tied to a live chunk holder.
+        for (BlockEventData event : sourceData.drainBlockEvents()) {
+            RegioniumRegion destination = nextOwners.get(ChunkPos.pack(
+                event.pos().getX() >> 4, event.pos().getZ() >> 4
+            ));
+            if (destination != null) {
+                destination.worldData().pushBlockEventDuringMigration(event);
+            }
         }
 
-        for (LevelChunk chunk : List.copyOf(region.worldData().chunks())) {
-            region.worldData().removeChunk(chunk);
+        // Move entities before retiring any region. A player may temporarily be
+        // present in more than one old world-data set after a merge; identity
+        // sets plus the destination check make this migration idempotent.
+        for (Entity entity : List.copyOf(sourceData.entities())) {
+            RegioniumRegion destination = nextOwners.get(entity.chunkPosition().pack());
+            if (destination == source) {
+                if (entity instanceof ServerPlayer player) {
+                    ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
+                        .regionium$updateRegion(sourceData);
+                }
+                continue;
+            }
+
+            sourceData.remove(entity);
+            if (destination != null) {
+                if (!destination.worldData().hasEntity(entity)) {
+                    destination.worldData().add(entity);
+                }
+                if (entity instanceof ServerPlayer player) {
+                    ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
+                        .regionium$updateRegion(destination.worldData());
+                }
+            } else if (entity instanceof ServerPlayer player) {
+                ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
+                    .regionium$updateRegion(null);
+            }
         }
-        region.worldData().clearPlayers();
+
+        // Repair any player-only membership left by an earlier inconsistent
+        // transfer; RegionizedWorldData.add/remove normally keep these sets in
+        // sync, but topology migration must not depend on that invariant.
+        for (ServerPlayer player : List.copyOf(sourceData.players())) {
+            RegioniumRegion destination = nextOwners.get(player.chunkPosition().pack());
+            if (destination == source) {
+                ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
+                    .regionium$updateRegion(sourceData);
+                continue;
+            }
+            sourceData.remove(player);
+            if (destination != null) {
+                if (!destination.worldData().hasEntity(player)) {
+                    destination.worldData().add(player);
+                }
+                ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
+                    .regionium$updateRegion(destination.worldData());
+            } else {
+                ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
+                    .regionium$updateRegion(null);
+            }
+        }
+
+        // LevelChunkTicks is the authoritative storage for pending ticks, but
+        // LevelTicks also indexes each container in its own scheduling queues.
+        // Unregister from the old manager before registering it in the new one;
+        // if stale data already registered the same chunk at the destination,
+        // remove/re-add that registration to restore its onTickAdded callback.
+        for (LevelChunk chunk : List.copyOf(sourceData.chunks())) {
+            long chunkKey = chunk.getPos().pack();
+            RegioniumRegion destination = nextOwners.get(chunkKey);
+            if (destination == source) {
+                continue;
+            }
+
+            ChunkHolder holder = state.chunkHolders.get(chunkKey);
+            LevelChunk authoritativeChunk = holder == null ? null : holder.getTickingChunk();
+            if (destination != null) {
+                LevelChunk existing = destination.worldData().chunks().stream()
+                    .filter(candidate -> candidate.getPos().pack() == chunkKey)
+                    .findFirst()
+                    .orElse(null);
+                if (existing != null) {
+                    destination.worldData().removeChunk(existing);
+                }
+            }
+
+            sourceData.removeChunk(chunk);
+            if (destination != null && authoritativeChunk != null) {
+                RegioniumWorldData destinationData = destination.worldData();
+                destinationData.addChunk(authoritativeChunk);
+                destinationData.setTickingChunk(authoritativeChunk, true);
+                LevelChunk entityTickingChunk = holder.getEntityTickingChunkFuture()
+                    .getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK)
+                    .orElse(null);
+                destinationData.setEntityTickingChunk(
+                    authoritativeChunk, authoritativeChunk == entityTickingChunk
+                );
+                // addChunk normally flushes deferred ticks immediately on the
+                // owner thread. Topology migration runs under the global write
+                // barrier instead, so enqueue the flush for the destination's
+                // first region tick rather than silently leaving it deferred.
+                destination.execute(() -> Regionium.scheduler().flushDeferredScheduledTicks(
+                    source.level(), chunkKey, destination
+                ));
+            }
+        }
+
+        for (ChunkHolder holder : List.copyOf(sourceData.chunkHoldersToBroadcast())) {
+            RegioniumRegion destination = nextOwners.get(holder.getPos().pack());
+            if (destination == source) {
+                continue;
+            }
+            if (destination != null) {
+                destination.worldData().chunkHoldersToBroadcast().add(holder);
+            }
+            sourceData.chunkHoldersToBroadcast().remove(holder);
+        }
+
+        if (!state.active.contains(source)) {
+            sourceData.clearPlayers();
+            sourceData.blockEntityTickers().clear();
+            sourceData.pendingBlockEntityTickers().clear();
+            sourceData.chunkHoldersToBroadcast().clear();
+        }
     }
 
     private static long sectionKey(int sectionX, int sectionZ) {

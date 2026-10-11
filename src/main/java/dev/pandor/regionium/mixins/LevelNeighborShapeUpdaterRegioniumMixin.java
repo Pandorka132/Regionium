@@ -12,7 +12,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-/** Keeps the mutable CollectingNeighborUpdater stack local to the ticking region. */
+/** Folia-style: shape updates use the current region's neighbor updater. */
 @Mixin(Level.class)
 abstract class LevelNeighborShapeUpdaterRegioniumMixin {
     @Inject(method = "neighborShapeChanged", at = @At("HEAD"), cancellable = true)
@@ -30,7 +30,7 @@ abstract class LevelNeighborShapeUpdaterRegioniumMixin {
         }
 
         var region = RegioniumContext.requireRegionThread();
-        Regionium.scheduler().worldData(level).neighborUpdater(region).shapeUpdate(
+        Regionium.scheduler().worldData(level).neighborUpdater().shapeUpdate(
             direction, neighborState, pos, neighborPos, updateFlags, updateLimit
         );
         ci.cancel();
