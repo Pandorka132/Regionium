@@ -37,9 +37,9 @@ public abstract class EntityRegioniumThreadMixin {
              * can observe the new position.
              */
             Regionium.scheduler().refreshEntityRegion(self);
-            if (self instanceof net.minecraft.server.level.ServerPlayer player) {
-                Regionium.scheduler().queueGlobalPlayerMove(player);
-            }
+            // The vanilla callback already updates global chunk tracking on
+            // the server thread. Do not enqueue a second ChunkMap.move() for
+            // the same position change.
             return;
         }
 
@@ -55,6 +55,11 @@ public abstract class EntityRegioniumThreadMixin {
         //
         // Do not call original here: doing so writes the global
         // EntitySectionStorage from the region worker and races other regions.
+        // Queue the corresponding ChunkMap.move() for the server thread; it
+        // must not run concurrently with another region's chunk tracking.
+        if (self instanceof net.minecraft.server.level.ServerPlayer player) {
+            Regionium.scheduler().queueGlobalPlayerMove(player);
+        }
         return;
     }
 
