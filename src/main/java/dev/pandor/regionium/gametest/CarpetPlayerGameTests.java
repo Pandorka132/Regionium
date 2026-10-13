@@ -468,6 +468,268 @@ public final class CarpetPlayerGameTests {
             .thenSucceed();
     }
 
+    /**
+     * A quasi-connectivity sticky-piston clock must keep oscillating while its
+     * nearby chunks are repeatedly merged into and split out of another
+     * player's region. Transfers are four game ticks apart, and the piston is
+     * sampled every third game tick to verify its actual oscillation cadence.
+     */
+    @GameTest(maxTicks = 1600)
+    public void stickyPistonClockSurvivesTwentyTransfers(GameTestHelper helper) {
+        final String moverName = "RegioniumPistonMove";
+        final String anchorName = "RegioniumPistonAnchor";
+        // Anchor the machine in the GameTest structure's already-active chunk;
+        // the mover remains far enough away to force real region split/merge.
+        final BlockPos structureAnchor = helper.absolutePos(new BlockPos(8, 1, 8));
+        final int baseX = structureAnchor.getX();
+        final int baseZ = structureAnchor.getZ();
+        final int destinationX = baseX + FAR_OFFSET;
+        final BlockPos piston = new BlockPos(baseX + 2, 80, baseZ + 2);
+        final BlockPos slime = piston.above();
+        final BlockPos redstone = slime.relative(Direction.SOUTH);
+        final BlockPos update = piston.relative(Direction.SOUTH);
+        final int[] previousState = {-1};
+        final int[] sampledTicks = {0};
+        final int[] sampleBaseline = {-1};
+        final int[] sampledChanges = {0};
+        final int[] sampledStates = new int[30];
+        final long[] sampledRegionTicks = new long[30];
+        final RegioniumRegion[] ownerBeforeTransfer = {null};
+        final int[] elapsedTicks = {0};
+        final int[] transfers = {0};
+
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+
+        var sequence = helper.startSequence();
+        sequence.thenExecute(() -> {
+            killBot(helper, moverName);
+            killBot(helper, anchorName);
+            runCommand(helper, "carpet allowSpawningOfflinePlayers true");
+            runCommand(helper, "forceload add " + baseX + " " + baseZ);
+            runCommand(helper, "forceload add " + destinationX + " " + baseZ);
+            runCommand(helper, "player " + anchorName + " spawn at " + baseX + " 80 " + baseZ);
+            runCommand(helper, "player " + moverName + " spawn at " + destinationX + " 80 " + baseZ);
+        });
+        sequence.thenWaitUntil(() -> waitForPairOwners(helper, moverName, anchorName));
+        sequence.thenWaitUntil(() -> {
+            ServerPlayer mover = requirePlayer(helper, moverName);
+            ServerPlayer anchor = requirePlayer(helper, anchorName);
+            if (!Regionium.scheduler().arePlayerPhysicsChunksReady(helper.getLevel(), mover)
+                || !Regionium.scheduler().arePlayerPhysicsChunksReady(helper.getLevel(), anchor)) {
+                throw helper.assertionException("Waiting for all player-adjacent chunks to become FULL");
+            }
+        });
+        sequence.thenExecute(() -> {
+            preparePlatform(helper, baseX, baseZ);
+            preparePlatform(helper, destinationX, baseZ);
+        });
+        sequence.thenWaitUntil(() -> waitForPlatforms(helper, baseX, baseZ, destinationX, baseZ));
+        sequence.thenExecute(() -> {
+            // Build the initial machine on the GameTest/server thread, then let
+            // Regionium own every subsequent piston tick and transfer.
+            var level = helper.getLevel();
+            // GameTest worlds can be reused across runs; clear stale blocks so
+            // the final setBlock really emits the neighbor update that starts
+            // the quasi-connectivity clock.
+            level.setBlock(piston, Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(slime, Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(redstone, Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(update, Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(piston.below(), Blocks.AIR.defaultBlockState(), 3);
+            level.setBlock(piston.below(), Blocks.STONE.defaultBlockState(), 3);
+            level.setBlock(piston, Blocks.STICKY_PISTON.defaultBlockState()
+                .setValue(BlockStateProperties.FACING, Direction.UP), 3);
+            level.setBlock(slime, Blocks.SLIME_BLOCK.defaultBlockState(), 3);
+            level.setBlock(redstone, Blocks.REDSTONE_BLOCK.defaultBlockState(), 3);
+            // Do not place scaffolding under the redstone block: the intended
+            // reproduction is exactly the piston, slime block, and redstone block.
+        });
+        sequence.thenExecute(() -> Regionium.scheduler().execute(helper.getLevel(), piston, () ->
+            helper.getLevel().neighborChanged(piston, Blocks.STONE, null)));
+        sequence.thenIdle(10);
+        sequence.thenExecute(() -> {
+            int state = stickyPistonClockState(helper.getLevel(), piston);
+            if (state == 3 || state == 2) {
+                throw helper.assertionException("Piston clock did not initialize: "
+                    + helper.getLevel().getBlockState(piston));
+            }
+            previousState[0] = state;
+        });
+        // Align the cadence window to a real piston transition. Otherwise a
+        // test window beginning immediately before the first pulse can compare
+        // two samples from the same side of the transition and report a false
+        // failure even though the clock is about to start oscillating.
+        sequence.thenWaitUntil(() -> {
+            int state = stickyPistonClockState(helper.getLevel(), piston);
+            if (state == 3 || state == 2 || state == previousState[0]) {
+                throw helper.assertionException("Waiting for first piston-clock transition: state="
+                    + state + ", piston=" + helper.getLevel().getBlockState(piston));
+            }
+            previousState[0] = state;
+        });
+        sequence.thenExecute(() -> {
+            sampledTicks[0] = 0;
+            sampleBaseline[0] = -1;
+            sampledChanges[0] = 0;
+            elapsedTicks[0] = 0;
+            transfers[0] = 0;
+        });
+        // Transfers are attempted exactly four game ticks apart. Verify the
+        // previous transfer's actual owner change at the next four-tick boundary,
+        // while sampling the piston once every three game ticks throughout.
+        sequence.thenExecuteFor(81, () -> {
+            int tick = elapsedTicks[0]++;
+            if (tick % 3 == 0) {
+                sampleStickyPistonClock(helper, piston, previousState, sampledTicks, sampleBaseline,
+                    sampledChanges, sampledStates, sampledRegionTicks, transfers[0]);
+            }
+            if (tick % 4 == 0) {
+                if (transfers[0] > 0) {
+                    int completedTransfer = transfers[0];
+                    assertTransferChangedOwner(helper, moverName, anchorName, ownerBeforeTransfer[0],
+                        completedTransfer, (completedTransfer & 1) == 1);
+                }
+                if (transfers[0] < 20) {
+                    int transferNumber = ++transfers[0];
+                    int targetX = (transferNumber & 1) == 1 ? baseX : destinationX;
+                    ownerBeforeTransfer[0] = Regionium.scheduler().regionizer().regionFor(
+                        requirePlayer(helper, moverName));
+                    if (ownerBeforeTransfer[0] == null) {
+                        throw helper.assertionException("Mover has no region before transfer " + transferNumber);
+                    }
+                    teleportPlayer(helper, moverName, targetX, baseZ);
+                }
+            }
+        });
+        sequence.thenExecute(() -> {
+            String failure = clockTransitionFailure(helper, piston, 20, sampledChanges[0],
+                sampledTicks[0], sampledStates, sampledRegionTicks);
+            if (failure != null) throw helper.assertionException(failure);
+            if (transfers[0] != 20) {
+                throw helper.assertionException("Expected 20 transfers, got " + transfers[0]);
+            }
+        });
+
+        sequence.thenExecute(() -> {
+            killBot(helper, moverName);
+            killBot(helper, anchorName);
+            runCommand(helper, "forceload remove " + baseX + " " + baseZ);
+            runCommand(helper, "forceload remove " + destinationX + " " + baseZ);
+        });
+        sequence.thenSucceed();
+    }
+
+    private static void sampleStickyPistonClock(
+        GameTestHelper helper,
+        BlockPos piston,
+        int[] previousState,
+        int[] sampledTicks,
+        int[] sampleBaseline,
+        int[] sampledChanges,
+        int[] sampledStates,
+        long[] sampledRegionTicks,
+        int transfer
+    ) {
+        int state = stickyPistonClockState(helper.getLevel(), piston);
+        if (state == 3) {
+            throw helper.assertionException("Piston clock left its expected state during transfer "
+                + transfer + ": " + helper.getLevel().getBlockState(piston));
+        }
+        sampledStates[sampledTicks[0]] = state;
+        var currentOwner = Regionium.scheduler().regionizer().owner(helper.getLevel(),
+            net.minecraft.world.level.ChunkPos.pack(piston));
+        sampledRegionTicks[sampledTicks[0]] = currentOwner == null ? -1L : currentOwner.tickCount();
+        if (sampledTicks[0] == 0) {
+            sampleBaseline[0] = state;
+        } else {
+            if (state == sampleBaseline[0]) {
+                throw helper.assertionException("Quasi-connectivity piston did not change state between "
+                    + "three-tick samples during transfer " + transfer + ": previous="
+                    + sampleBaseline[0] + ", current=" + state + ", sample=" + sampledTicks[0]);
+            }
+            sampledChanges[0]++;
+            sampleBaseline[0] = state;
+        }
+        previousState[0] = state;
+        sampledTicks[0]++;
+    }
+
+    private static String clockTransitionFailure(
+        GameTestHelper helper,
+        BlockPos piston,
+        int transfer,
+        int sampledChanges,
+        int sampledTicks,
+        int[] sampledStates,
+        long[] sampledRegionTicks
+    ) {
+        int expectedChanges = Math.max(0, sampledTicks - 1);
+        if (sampledChanges != expectedChanges || sampledTicks < 20) {
+            var level = helper.getLevel();
+            var owner = Regionium.scheduler().regionizer().owner(level,
+                net.minecraft.world.level.ChunkPos.pack(piston));
+            return "Quasi-connectivity piston clock failed three-game-tick cadence during transfer sequence " + transfer
+                    + ": changes=" + sampledChanges + "/" + expectedChanges
+                    + ", sampledTicks=" + sampledTicks + ", trace="
+                    + java.util.Arrays.toString(java.util.Arrays.copyOf(sampledStates, sampledTicks))
+                    + ", regionTicks="
+                    + java.util.Arrays.toString(java.util.Arrays.copyOf(sampledRegionTicks, sampledTicks))
+                    + ", piston=" + level.getBlockState(piston)
+                    + ", slime=" + level.getBlockState(piston.above())
+                    + ", redstone=" + level.getBlockState(piston.above().relative(Direction.SOUTH))
+                    + ", update=" + level.getBlockState(piston.relative(Direction.SOUTH))
+                    + ", shouldTick=" + level.shouldTickBlocksAt(piston)
+                    + ", owner=" + owner
+                    + ", ownerHasChunk=" + (owner != null && owner.worldData().hasChunk(
+                        net.minecraft.world.level.ChunkPos.pack(piston)));
+        }
+        return null;
+    }
+
+    private static void assertTransferChangedOwner(
+        GameTestHelper helper,
+        String moverName,
+        String anchorName,
+        RegioniumRegion previousOwner,
+        int transfer,
+        boolean shouldMerge
+    ) {
+        ServerPlayer mover = requirePlayer(helper, moverName);
+        ServerPlayer anchor = requirePlayer(helper, anchorName);
+        RegioniumRegion currentOwner = Regionium.scheduler().regionizer().regionFor(mover);
+        RegioniumRegion anchorOwner = Regionium.scheduler().regionizer().regionFor(anchor);
+        if (currentOwner == null || currentOwner == previousOwner
+            || (shouldMerge ? currentOwner != anchorOwner : currentOwner == anchorOwner)) {
+            throw helper.assertionException("Transfer " + transfer + " did not change the mover's region: "
+                + "previous=" + previousOwner + ", current=" + currentOwner
+                + ", anchor=" + anchorOwner + ", expectedMerge=" + shouldMerge
+                + ", moverChunk=" + mover.chunkPosition() + ", anchorChunk=" + anchor.chunkPosition());
+        }
+    }
+
+    private static int stickyPistonClockState(
+        net.minecraft.server.level.ServerLevel level,
+        BlockPos piston
+    ) {
+        var state = level.getBlockState(piston);
+        if (state.is(Blocks.MOVING_PISTON)) {
+            var blockEntity = level.getBlockEntity(piston);
+            if (blockEntity instanceof net.minecraft.world.level.block.piston.PistonMovingBlockEntity moving
+                && moving.isSourcePiston()) {
+                // The source piston is represented by MOVING_PISTON during its
+                // animation. Observe its logical direction, not that transient
+                // rendering state, or a valid two-tick pulse looks like a stall.
+                return moving.isExtending() ? 1 : 0;
+            }
+            return 2;
+        }
+        if (state.is(Blocks.STICKY_PISTON)) {
+            return state.getValue(BlockStateProperties.EXTENDED) ? 1 : 0;
+        }
+        return 3;
+    }
+
     private static void assertRegionTopologyConsistent(GameTestHelper helper) {
         var regionizer = Regionium.scheduler().regionizer();
         var active = regionizer.activeRegions(helper.getLevel());
@@ -483,13 +745,19 @@ public final class CarpetPlayerGameTests {
     }
 
     private static void preparePlatform(GameTestHelper helper, int x) {
-        Regionium.scheduler().execute(helper.getLevel(), new BlockPos(x, 80, 0), () -> {
-            for (int dx = 0; dx <= 24; dx++) {
-                for (int z = 0; z <= 4; z++) {
+        preparePlatform(helper, x, 0);
+    }
+
+    private static void preparePlatform(GameTestHelper helper, int x, int z) {
+        Regionium.scheduler().execute(helper.getLevel(), new BlockPos(x, 80, z), () -> {
+            // Keep setup scaffolding inside the player's owned chunk and avoid
+            // neighbor propagation into chunks that this test region does not own.
+            for (int dx = 0; dx < 8; dx++) {
+                for (int dz = 0; dz <= 4; dz++) {
                     helper.getLevel().setBlock(
-                        new BlockPos(x + dx, 79, z),
+                        new BlockPos(x + dx, 79, z + dz),
                         Blocks.STONE.defaultBlockState(),
-                        3
+                        2
                     );
                 }
             }
@@ -497,16 +765,26 @@ public final class CarpetPlayerGameTests {
     }
 
     private static void waitForPlatforms(GameTestHelper helper, int firstX, int secondX) {
-        if (!helper.getLevel().getBlockState(new BlockPos(firstX, 79, 0)).is(Blocks.STONE)
-            || !helper.getLevel().getBlockState(new BlockPos(secondX, 79, 0)).is(Blocks.STONE)) {
+        waitForPlatforms(helper, firstX, 0, secondX, 0);
+    }
+
+    private static void waitForPlatforms(
+        GameTestHelper helper, int firstX, int firstZ, int secondX, int secondZ
+    ) {
+        if (!helper.getLevel().getBlockState(new BlockPos(firstX, 79, firstZ)).is(Blocks.STONE)
+            || !helper.getLevel().getBlockState(new BlockPos(secondX, 79, secondZ)).is(Blocks.STONE)) {
             throw helper.assertionException("Waiting for transfer test platforms to be built");
         }
     }
 
     private static void teleportPlayer(GameTestHelper helper, String name, int x) {
+        teleportPlayer(helper, name, x, 0);
+    }
+
+    private static void teleportPlayer(GameTestHelper helper, String name, int x, int z) {
         ServerPlayer player = requirePlayer(helper, name);
         player.teleportTo(
-            helper.getLevel(), x, 80.0, 0.0, java.util.Set.of(),
+            helper.getLevel(), x, 80.0, z, java.util.Set.of(),
             player.getYRot(), player.getXRot(), true
         );
     }
