@@ -106,6 +106,13 @@ public abstract class ServerLevelTickRegioniumMixin {
             return;
         }
 
+        // The global server pass advances LevelData.gameTime once. A region
+        // advances its own redstone clock independently, matching Folia's
+        // RegionizedWorldData.getRedstoneGameTime().
+        ServerLevel level = (ServerLevel) (Object) this;
+        if (((ServerLevelRegioniumTimeAccessor) (Object) level).regionium$isTickTime()) {
+            RegioniumContext.requireRegionThread().worldData().advanceRedstoneTime();
+        }
         ci.cancel();
     }
 

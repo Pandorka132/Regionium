@@ -64,7 +64,7 @@ public final class RegioniumScheduler implements AutoCloseable {
     // the containers; otherwise vanilla logs that the position is not loaded
     // and drops the scheduled tick.
     private final ConcurrentMap<ChunkExecutionKey,
-        ConcurrentLinkedQueue<net.minecraft.world.ticks.ScheduledTick<?>>> deferredScheduledTicks =
+        ConcurrentLinkedQueue<DeferredScheduledTick>> deferredScheduledTicks =
         new ConcurrentHashMap<>();
 
     /*
@@ -86,6 +86,7 @@ public final class RegioniumScheduler implements AutoCloseable {
     private static final AtomicInteger DEBUG_MAX_WORKERS = new AtomicInteger();
 
     private record ChunkExecutionKey(ServerLevel level, long chunk) {}
+    private record DeferredScheduledTick(net.minecraft.world.ticks.ScheduledTick<?> tick, long clockTime) {}
 
     public RegioniumScheduler() {
         this(DEFAULT_REGION_COUNT);
@@ -426,29 +427,48 @@ public final class RegioniumScheduler implements AutoCloseable {
         net.minecraft.world.ticks.ScheduledTick<?> tick
     ) {
         long chunkKey = ChunkPos.pack(tick.pos());
+        RegioniumRegion owner = regionizer.owner(level, chunkKey);
+        RegioniumRegion current = RegioniumContext.currentRegion();
+        long clockTime = owner != null
+            ? owner.worldData().redstoneTime()
+            : current != null && current.level() == level
+                ? current.worldData().redstoneTime()
+                : level.getGameTime();
+        return routeScheduledTick(level, tick, clockTime);
+    }
+
+    private boolean routeScheduledTick(
+        ServerLevel level,
+        net.minecraft.world.ticks.ScheduledTick<?> tick,
+        long clockTime
+    ) {
+        long chunkKey = ChunkPos.pack(tick.pos());
         RegioniumRegion region = regionizer.owner(level, chunkKey);
         RegioniumRegion current = RegioniumContext.currentRegion();
         if (region == null) {
             // During chunk promotion the target may not have been published in
-            // the region topology yet. A region-generated tick must not fall
-            // through to a LevelTicks queue that has no container for it.
-            // Keep it until the chunk is assigned and registered; calls made
-            // outside a region retain vanilla's normal behavior.
+            // the region topology yet. Preserve the clock that created the tick
+            // so it can be rebased if a different region eventually owns it.
             if (current != null && current.level() == level) {
-                deferScheduledTick(level, chunkKey, tick);
+                deferScheduledTick(level, chunkKey, tick, clockTime);
                 return true;
             }
             return false;
         }
 
         if (current == region) {
-            // The owner thread is the only thread allowed to inspect its
-            // mutable chunk set. A spatial owner may be published before the
-            // ticking LevelChunk and its LevelChunkTicks containers are ready.
             if (region.worldData().hasChunk(chunkKey)) {
-                return false;
+                if (clockTime == region.worldData().redstoneTime()) {
+                    return false;
+                }
+                scheduleTickInRegion(region, rebaseScheduledTick(
+                    tick, clockTime, region.worldData().redstoneTime()
+                ));
+                return true;
             }
-            deferScheduledTick(level, chunkKey, tick);
+            // A spatial owner may be published before the ticking LevelChunk
+            // and its LevelChunkTicks containers are ready.
+            deferScheduledTick(level, chunkKey, tick, clockTime);
             return true;
         }
 
@@ -459,25 +479,25 @@ public final class RegioniumScheduler implements AutoCloseable {
             RegioniumRegion actualOwner = regionizer.owner(level, chunkKey);
             if (actualOwner != region) {
                 if (actualOwner != null) {
-                    routeScheduledTick(level, tick);
+                    routeScheduledTick(level, tick, clockTime);
                 }
                 return;
             }
             if (!region.worldData().hasChunk(chunkKey)) {
-                // Ownership can precede container registration during chunk
-                // promotion. Preserve the tick until addChunk() registers it.
-                deferScheduledTick(level, chunkKey, tick);
+                deferScheduledTick(level, chunkKey, tick, clockTime);
                 return;
             }
-            scheduleTickInRegion(region, tick);
+            scheduleTickInRegion(region, rebaseScheduledTick(
+                tick, clockTime, region.worldData().redstoneTime()
+            ));
         });
 
         if (!accepted) {
             RegioniumRegion actualOwner = regionizer.owner(level, chunkKey);
             if (actualOwner != null && actualOwner != region) {
-                return routeScheduledTick(level, tick);
+                return routeScheduledTick(level, tick, clockTime);
             }
-            deferScheduledTick(level, chunkKey, tick);
+            deferScheduledTick(level, chunkKey, tick, clockTime);
         }
         return true;
     }
@@ -485,11 +505,12 @@ public final class RegioniumScheduler implements AutoCloseable {
     private void deferScheduledTick(
         ServerLevel level,
         long chunkKey,
-        net.minecraft.world.ticks.ScheduledTick<?> tick
+        net.minecraft.world.ticks.ScheduledTick<?> tick,
+        long clockTime
     ) {
         deferredScheduledTicks.computeIfAbsent(
             new ChunkExecutionKey(level, chunkKey), ignored -> new ConcurrentLinkedQueue<>()
-        ).add(tick);
+        ).add(new DeferredScheduledTick(tick, clockTime));
     }
 
     /** Called on the owner region thread immediately after its chunk containers are registered. */
@@ -499,23 +520,40 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
 
         ChunkExecutionKey key = new ChunkExecutionKey(level, chunkKey);
-        ConcurrentLinkedQueue<net.minecraft.world.ticks.ScheduledTick<?>> pending =
-            deferredScheduledTicks.remove(key);
+        ConcurrentLinkedQueue<DeferredScheduledTick> pending = deferredScheduledTicks.remove(key);
         if (pending == null) {
             return;
         }
 
-        net.minecraft.world.ticks.ScheduledTick<?> tick;
-        while ((tick = pending.poll()) != null) {
+        DeferredScheduledTick deferred;
+        while ((deferred = pending.poll()) != null) {
             RegioniumRegion currentOwner = regionizer.owner(level, chunkKey);
             if (currentOwner != region) {
                 if (currentOwner != null) {
-                    routeScheduledTick(level, tick);
+                    routeScheduledTick(level, deferred.tick(), deferred.clockTime());
                 }
                 continue;
             }
-            scheduleTickInRegion(region, tick);
+            scheduleTickInRegion(region, rebaseScheduledTick(
+                deferred.tick(), deferred.clockTime(), region.worldData().redstoneTime()
+            ));
         }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static net.minecraft.world.ticks.ScheduledTick<?> rebaseScheduledTick(
+        net.minecraft.world.ticks.ScheduledTick<?> tick,
+        long fromClock,
+        long toClock
+    ) {
+        long offset = toClock - fromClock;
+        if (offset == 0L) {
+            return tick;
+        }
+        return new net.minecraft.world.ticks.ScheduledTick(
+            tick.type(), tick.pos(), tick.triggerTick() + offset,
+            tick.priority(), tick.subTickOrder()
+        );
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -645,7 +683,7 @@ public final class RegioniumScheduler implements AutoCloseable {
         }
 
         regionTicks.tick(
-            level.getLevelData().getGameTime(),
+            current.worldData().redstoneTime(),
             maxTicks,
             callback
         );
