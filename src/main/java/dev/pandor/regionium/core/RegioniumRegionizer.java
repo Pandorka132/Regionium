@@ -2,6 +2,7 @@ package dev.pandor.regionium.core;
 
 import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -881,6 +882,35 @@ public final class RegioniumRegionizer {
             }
         }
 
+        // Folia migrates both block-entity ticker lists explicitly. A ticker
+        // that is pending insertion at the end of the current tick may not yet
+        // be present in LevelChunk's ticker map, so rebuilding from the chunk
+        // alone can silently lose it during a region transfer.
+        for (net.minecraft.world.level.block.entity.TickingBlockEntity ticker
+            : List.copyOf(sourceData.blockEntityTickers())) {
+            long tickerChunk = ChunkPos.containing(ticker.getPos()).pack();
+            RegioniumRegion destination = nextOwners.get(tickerChunk);
+            if (destination == source) {
+                continue;
+            }
+            sourceData.removeBlockEntityTicker(ticker);
+            if (destination != null) {
+                destination.worldData().addMigratedBlockEntityTicker(ticker, false);
+            }
+        }
+        for (net.minecraft.world.level.block.entity.TickingBlockEntity ticker
+            : List.copyOf(sourceData.pendingBlockEntityTickers())) {
+            long tickerChunk = ChunkPos.containing(ticker.getPos()).pack();
+            RegioniumRegion destination = nextOwners.get(tickerChunk);
+            if (destination == source) {
+                continue;
+            }
+            sourceData.removeBlockEntityTicker(ticker);
+            if (destination != null) {
+                destination.worldData().addMigratedBlockEntityTicker(ticker, true);
+            }
+        }
+
         // LevelChunkTicks is the authoritative storage for pending ticks, but
         // LevelTicks also indexes each container in its own scheduling queues.
         // Unregister from the old manager before registering it in the new one;
@@ -895,19 +925,34 @@ public final class RegioniumRegionizer {
 
             ChunkHolder holder = state.chunkHolders.get(chunkKey);
             LevelChunk authoritativeChunk = holder == null ? null : holder.getTickingChunk();
-            if (destination != null) {
-                LevelChunk existing = destination.worldData().chunks().stream()
+            RegioniumWorldData destinationData = destination == null ? null : destination.worldData();
+            boolean destinationWasEmpty = destinationData != null && destinationData.chunks().isEmpty();
+            if (destinationData != null) {
+                LevelChunk existing = destinationData.chunks().stream()
                     .filter(candidate -> candidate.getPos().pack() == chunkKey)
                     .findFirst()
                     .orElse(null);
                 if (existing != null) {
-                    destination.worldData().removeChunk(existing);
+                    destinationData.removeChunk(existing);
+                }
+            }
+
+            // Split-created regions inherit the source clock. When a chunk is
+            // merged into an already active region, preserve the remaining
+            // delay of each pending block/fluid tick by rebasing its absolute
+            // trigger time from the source clock to the destination clock.
+            long tickTimeOffset = 0L;
+            if (destinationData != null) {
+                if (destinationWasEmpty) {
+                    destinationData.inheritRedstoneTimeIfEmpty(sourceData);
+                } else {
+                    tickTimeOffset = destinationData.redstoneTime() - sourceData.redstoneTime();
                 }
             }
 
             sourceData.removeChunk(chunk);
-            if (destination != null && authoritativeChunk != null) {
-                RegioniumWorldData destinationData = destination.worldData();
+            if (destinationData != null && authoritativeChunk != null) {
+                RegioniumWorldData.shiftScheduledTicks(authoritativeChunk, tickTimeOffset);
                 destinationData.addChunk(authoritativeChunk);
                 destinationData.setTickingChunk(authoritativeChunk, true);
                 LevelChunk entityTickingChunk = holder.getEntityTickingChunkFuture()
@@ -926,6 +971,32 @@ public final class RegioniumRegionizer {
             }
         }
 
+        // Folia keeps redstone-torch toggle history in region data. Minecraft
+        // 26.3 stores it in one static Level-keyed map, which would be shared
+        // concurrently by every Regionium worker. Move each history entry with
+        // the chunk that owns its position and rebase its timestamp to the new
+        // region clock, just like pending scheduled ticks.
+        for (net.minecraft.world.level.block.RedstoneTorchBlock.Toggle toggle
+            : List.copyOf(sourceData.redstoneUpdateInfos())) {
+            BlockPos togglePos = ((dev.pandor.regionium.mixins.RedstoneTorchToggleRegioniumAccessorMixin)
+                (Object) toggle).regionium$getPos();
+            long toggleChunk = ChunkPos.pack(togglePos);
+            RegioniumRegion destination = nextOwners.get(toggleChunk);
+            if (destination == source) {
+                continue;
+            }
+
+            sourceData.redstoneUpdateInfos().remove(toggle);
+            if (destination != null) {
+                long offset = destination.worldData().redstoneTime() - sourceData.redstoneTime();
+                long when = ((dev.pandor.regionium.mixins.RedstoneTorchToggleRegioniumAccessorMixin)
+                    (Object) toggle).regionium$getWhen();
+                destination.worldData().redstoneUpdateInfos().add(
+                    new net.minecraft.world.level.block.RedstoneTorchBlock.Toggle(togglePos, when + offset)
+                );
+            }
+        }
+
         for (ChunkHolder holder : List.copyOf(sourceData.chunkHoldersToBroadcast())) {
             RegioniumRegion destination = nextOwners.get(holder.getPos().pack());
             if (destination == source) {
@@ -941,6 +1012,7 @@ public final class RegioniumRegionizer {
             sourceData.clearPlayers();
             sourceData.blockEntityTickers().clear();
             sourceData.pendingBlockEntityTickers().clear();
+            sourceData.redstoneUpdateInfos().clear();
             sourceData.chunkHoldersToBroadcast().clear();
         }
     }

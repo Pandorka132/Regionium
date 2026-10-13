@@ -468,6 +468,81 @@ public final class CarpetPlayerGameTests {
             .thenSucceed();
     }
 
+    @GameTest(maxTicks = 100)
+    public void scheduledTickTimeRebasePreservesDelay(GameTestHelper helper) {
+        var level = helper.getLevel();
+        Regionium.scheduler().registerLevel(level);
+        Regionium.scheduler().refreshChunkLeases(level);
+
+        BlockPos pos = helper.absolutePos(new BlockPos(1, 1, 1));
+        java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicReference<String> failure = new java.util.concurrent.atomic.AtomicReference<>();
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                if (Regionium.scheduler().regionizer().owner(
+                    level, net.minecraft.world.level.ChunkPos.pack(pos)) == null) {
+                    throw helper.assertionException("Scheduled-tick test chunk is not assigned to a region yet");
+                }
+            })
+            .thenExecute(() -> {
+                RegioniumRegion owner = Regionium.scheduler().regionizer().owner(
+                    level, net.minecraft.world.level.ChunkPos.pack(pos));
+                if (owner == null) {
+                    throw helper.assertionException("Scheduled-tick test chunk has no region owner");
+                }
+
+                owner.execute(() -> {
+                    try {
+                        var chunk = level.getChunkAt(pos);
+                        var ticks = ((dev.pandor.regionium.mixins.LevelChunkRegioniumTickAccessorMixin)
+                            (Object) chunk).regionium$getBlockTicks();
+                        long originalTrigger = owner.worldData().redstoneTime() + 100L;
+                        ticks.schedule(new net.minecraft.world.ticks.ScheduledTick<>(
+                            Blocks.STONE, pos, originalTrigger, net.minecraft.world.ticks.TickPriority.NORMAL,
+                            owner.worldData().nextSubTickCount()
+                        ));
+
+                        dev.pandor.regionium.core.RegioniumWorldData.shiftScheduledTicks(chunk, 37L);
+                        long expectedTrigger = originalTrigger + 37L;
+
+                        // Deliberately desynchronize this test region from global gameTime:
+                        // createTick must use the owner region's clock, not LevelData.gameTime.
+                        for (int i = 0; i < 25; i++) {
+                            owner.worldData().advanceRedstoneTime();
+                        }
+                        long expectedCreatedTrigger = owner.worldData().redstoneTime() + 13L;
+                        var created = level.createTick(
+                            pos.above(), Blocks.STONE, 13
+                        );
+                        if (created.triggerTick() != expectedCreatedTrigger) {
+                            failure.set("New scheduled tick used the wrong clock: expected trigger="
+                                + expectedCreatedTrigger + ", actual=" + created.triggerTick());
+                        }
+                        var shifted = ticks.getAll()
+                            .filter(tick -> tick.pos().equals(pos) && tick.type() == Blocks.STONE)
+                            .findFirst()
+                            .orElse(null);
+                        if (shifted == null || shifted.triggerTick() != expectedTrigger) {
+                            failure.set("Scheduled tick delay changed during clock rebase: expected trigger="
+                                + expectedTrigger + ", actual=" + shifted);
+                        }
+                    } catch (Throwable error) {
+                        failure.set("Scheduled tick clock rebase threw " + error);
+                    } finally {
+                        finished.set(true);
+                    }
+                });
+            })
+            .thenWaitUntil(finished::get)
+            .thenExecute(() -> {
+                if (failure.get() != null) {
+                    throw helper.assertionException(failure.get());
+                }
+            })
+            .thenSucceed();
+    }
+
     /**
      * A quasi-connectivity sticky-piston clock must keep oscillating while its
      * nearby chunks are repeatedly merged into and split out of another

@@ -8,6 +8,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.RedstoneTorchBlock;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
 import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
 import net.minecraft.world.level.redstone.NeighborUpdater;
@@ -19,6 +20,7 @@ import net.minecraft.world.ticks.LevelChunkTicks;
 import net.minecraft.world.ticks.LevelTicks;
 
 import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -57,12 +59,19 @@ public final class RegioniumWorldData {
     private final LevelTicks<Fluid> fluidTicks;
     private final NeighborUpdater neighborUpdater;
     private final ObjectLinkedOpenHashSet<BlockEventData> blockEvents = new ObjectLinkedOpenHashSet<>();
+    private final List<RedstoneTorchBlock.Toggle> redstoneUpdateInfos = new ArrayList<>();
+    // Folia keeps redstone/scheduled-tick time per region instead of reusing
+    // the global daylight/game-time clock. The value is volatile because
+    // topology migration may inspect it while holding the region tick barrier.
+    private volatile long redstoneTime;
+    private final AtomicLong subTickCount = new AtomicLong();
     private volatile boolean handlingTick;
     private volatile boolean tickingBlockEntities;
 
     RegioniumWorldData(ServerLevel level, RegioniumRegion region) {
         this.level = level;
         this.region = region;
+        this.redstoneTime = level.getLevelData().getGameTime();
 
         this.blockTicks = new LevelTicks<>(
             pos -> ownsChunk(pos)
@@ -126,6 +135,70 @@ public final class RegioniumWorldData {
 
     public NeighborUpdater neighborUpdater() {
         return neighborUpdater;
+    }
+
+    public long redstoneTime() {
+        return redstoneTime;
+    }
+
+    /** Recent redstone-torch toggles owned exclusively by this region. */
+    public List<RedstoneTorchBlock.Toggle> redstoneUpdateInfos() {
+        return redstoneUpdateInfos;
+    }
+
+    public void advanceRedstoneTime() {
+        redstoneTime++;
+    }
+
+    public long nextSubTickCount() {
+        return subTickCount.getAndIncrement();
+    }
+
+    /**
+     * A newly created region produced by a split inherits the source region's
+     * clock. Existing regions keep their own clock; pending chunk ticks moved
+     * into them are shifted by the clock difference during migration.
+     */
+    public void inheritRedstoneTimeIfEmpty(RegioniumWorldData source) {
+        if (chunks.isEmpty()) {
+            redstoneTime = source.redstoneTime;
+        }
+    }
+
+    /**
+     * Rebase the pending scheduled ticks stored by a chunk when its region
+     * changes. LevelChunkTicks stores absolute trigger times, so moving the
+     * container without shifting these values changes the delay of every
+     * pending block/fluid tick.
+     */
+    public static void shiftScheduledTicks(LevelChunk chunk, long offset) {
+        if (offset == 0L) {
+            return;
+        }
+        @SuppressWarnings("unchecked")
+        LevelChunkTicks<Block> block = (LevelChunkTicks<Block>)
+            ((dev.pandor.regionium.mixins.LevelChunkRegioniumTickAccessorMixin) chunk)
+                .regionium$getBlockTicks();
+        @SuppressWarnings("unchecked")
+        LevelChunkTicks<Fluid> fluid = (LevelChunkTicks<Fluid>)
+            ((dev.pandor.regionium.mixins.LevelChunkRegioniumTickAccessorMixin) chunk)
+                .regionium$getFluidTicks();
+        shiftTicks(block, offset);
+        shiftTicks(fluid, offset);
+    }
+
+    private static <T> void shiftTicks(LevelChunkTicks<T> ticks, long offset) {
+        List<net.minecraft.world.ticks.ScheduledTick<T>> pending = ticks.getAll().toList();
+        if (pending.isEmpty()) {
+            return;
+        }
+        ticks.removeIf(ignored -> true);
+        for (net.minecraft.world.ticks.ScheduledTick<T> tick : pending) {
+            ticks.schedule(new net.minecraft.world.ticks.ScheduledTick<>(
+                tick.type(), tick.pos(), tick.triggerTick() + offset,
+                tick.priority(), tick.subTickOrder()
+            ));
+        }
     }
 
     public void pushBlockEvent(BlockEventData event) {
@@ -286,6 +359,18 @@ public final class RegioniumWorldData {
             return;
         }
         (tickingBlockEntities ? pendingBlockEntityTickers : blockEntityTickers).add(ticker);
+    }
+
+    /**
+     * Transfers an existing ticker without changing whether it was waiting to
+     * be appended at the end of the current block-entity tick pass. Folia keeps
+     * these two lists separate during region merge/split for this reason.
+     */
+    public void addMigratedBlockEntityTicker(TickingBlockEntity ticker, boolean pending) {
+        if (containsTicker(ticker)) {
+            return;
+        }
+        (pending ? pendingBlockEntityTickers : blockEntityTickers).add(ticker);
     }
 
     public boolean containsTicker(TickingBlockEntity ticker) {

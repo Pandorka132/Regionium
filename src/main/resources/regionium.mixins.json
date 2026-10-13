@@ -10,6 +10,9 @@
     "ServerLevelTickTimeInvokerMixin",
     "ServerLevelEntityManagerAccessorMixin",
     "LevelTicksRegioniumScheduleMixin",
+    "LevelAccessorRegioniumTickTimeMixin",
+    "RedstoneTorchBlockRegioniumMixin",
+    "RedstoneTorchToggleRegioniumAccessorMixin",
     "LevelBlockEntityTickRegioniumMixin",
     "ServerLevelEntityTickRegioniumMixin",
     "ServerLevelEntityCallbacksRegioniumMixin",
@@ -42,6 +45,7 @@
     "ChunkHolderRegioniumMixin",
     "ChunkMapRegioniumVisibleAccessorMixin",
     "LevelChunkRegioniumTickAccessorMixin",
+    "LevelChunkRegioniumTimeMixin",
     "ServerConnectionListenerRegioniumMixin",
     "ServerCommonPacketListenerRegioniumMixin",
     "PlayerChunkSenderRegioniumMixin"

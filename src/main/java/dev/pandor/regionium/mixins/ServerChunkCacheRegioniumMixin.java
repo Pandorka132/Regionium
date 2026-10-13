@@ -91,6 +91,110 @@ public abstract class ServerChunkCacheRegioniumMixin {
         }
     }
 
+    /**
+     * LightEngine callbacks can arrive on the global chunk/light worker path.
+     * Folia transfers these notifications to the region owning the affected
+     * chunk; leaving them in ServerChunkCache's global broadcast set means
+     * they are never flushed by a region tick.
+     */
+    @Inject(method = "onLightUpdate", at = @At("HEAD"), cancellable = true)
+    private void regionium$routeLightUpdate(
+        net.minecraft.world.level.LightLayer layer,
+        SectionPos pos,
+        CallbackInfo ci
+    ) {
+        long chunkKey = pos.chunk().pack();
+        var owner = Regionium.scheduler().regionizer().owner(level, chunkKey);
+        if (owner == null) {
+            // Chunks not yet present in the region topology retain vanilla
+            // handling during promotion/unload.
+            return;
+        }
+
+        var current = RegioniumContext.isRegionThread()
+            ? RegioniumContext.currentRegion()
+            : null;
+        if (owner != current) {
+            if (!owner.execute(() -> regionium$recordLightUpdate(layer, pos, chunkKey, owner))) {
+                return;
+            }
+            ci.cancel();
+            return;
+        }
+
+        regionium$recordLightUpdate(layer, pos, chunkKey, owner);
+        ci.cancel();
+    }
+
+    private void regionium$recordLightUpdate(
+        net.minecraft.world.level.LightLayer layer,
+        SectionPos pos,
+        long chunkKey,
+        dev.pandor.regionium.core.RegioniumRegion expectedOwner
+    ) {
+        var owner = Regionium.scheduler().regionizer().owner(level, chunkKey);
+        if (owner == null) {
+            return;
+        }
+        if (owner != expectedOwner) {
+            owner.execute(() -> regionium$recordLightUpdate(layer, pos, chunkKey, owner));
+            return;
+        }
+
+        ChunkHolder holder = ((ChunkMapRegioniumVisibleAccessorMixin) chunkMap)
+            .regionium$getVisibleChunkMap().get(chunkKey);
+        if (holder != null && holder.sectionLightChanged(layer, pos.y())) {
+            Regionium.scheduler().worldData(level).chunkHoldersToBroadcast(owner).add(holder);
+        }
+    }
+
+    /**
+     * A holder can become ready to send while it already has pending changes.
+     * Keep that notification with its region instead of the global cache queue.
+     */
+    @Inject(method = "onChunkReadyToSend", at = @At("HEAD"), cancellable = true)
+    private void regionium$routeChunkReadyToSend(ChunkHolder holder, CallbackInfo ci) {
+        if (!holder.hasChangesToBroadcast()) {
+            return;
+        }
+
+        long chunkKey = holder.getPos().pack();
+        var owner = Regionium.scheduler().regionizer().owner(level, chunkKey);
+        if (owner == null) {
+            return;
+        }
+
+        var current = RegioniumContext.isRegionThread()
+            ? RegioniumContext.currentRegion()
+            : null;
+        if (owner != current) {
+            if (!owner.execute(() -> regionium$queueChunkHolder(holder, chunkKey, owner))) {
+                return;
+            }
+            ci.cancel();
+            return;
+        }
+
+        regionium$queueChunkHolder(holder, chunkKey, owner);
+        ci.cancel();
+    }
+
+    private void regionium$queueChunkHolder(
+        ChunkHolder holder,
+        long chunkKey,
+        dev.pandor.regionium.core.RegioniumRegion expectedOwner
+    ) {
+        var owner = Regionium.scheduler().regionizer().owner(level, chunkKey);
+        if (owner == null) {
+            return;
+        }
+        if (owner != expectedOwner) {
+            owner.execute(() -> regionium$queueChunkHolder(holder, chunkKey, owner));
+            return;
+        }
+        Regionium.scheduler().worldData(level).chunkHoldersToBroadcast(owner).add(holder);
+    }
+
     @Inject(method = "tick", at = @At("HEAD"), cancellable = true)
     private void regionium$regionLocalChunkTick(
         java.util.function.BooleanSupplier haveTime,
@@ -155,7 +259,7 @@ public abstract class ServerChunkCacheRegioniumMixin {
          * on the server but never sent to clients.
          */
         for (var holder : List.copyOf(current.worldData().chunkHoldersToBroadcast())) {
-            var chunk = holder.getTickingChunk();
+            var chunk = holder.getChunkToSend();
             if (chunk != null) {
                 holder.broadcastChanges(chunk);
             }
