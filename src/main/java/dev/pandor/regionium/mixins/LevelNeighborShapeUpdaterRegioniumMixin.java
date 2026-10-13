@@ -1,6 +1,5 @@
 package dev.pandor.regionium.mixins;
 
-import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -30,7 +29,7 @@ abstract class LevelNeighborShapeUpdaterRegioniumMixin {
         }
 
         var region = RegioniumContext.requireRegionThread();
-        Regionium.scheduler().worldData(level).neighborUpdater().shapeUpdate(
+        region.worldData().neighborUpdater().shapeUpdate(
             direction, neighborState, pos, neighborPos, updateFlags, updateLimit
         );
         ci.cancel();
