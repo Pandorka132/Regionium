@@ -56,10 +56,20 @@ public abstract class ServerLevelEntityTickRegioniumMixin {
             // entity-ticking set. Regionium previously ticked every entity
             // belonging to the region, even when its ChunkHolder had not
             // reached ENTITY_TICKING/FULL yet.
+            long entityChunkKey = entity.chunkPosition().pack();
+            // ChunkHolder futures describe the loading/status pipeline. The
+            // DistanceManager's simulation tracker is the authoritative gate
+            // for whether this entity is eligible to tick at the current
+            // simulation distance.
+            if (!level.getChunkSource().chunkMap.getDistanceManager()
+                .inEntityTickingRange(entityChunkKey)) {
+                continue;
+            }
+
             var holder = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
                 (Object) level.getChunkSource().chunkMap)
                 .regionium$getVisibleChunkMap()
-                .get(entity.chunkPosition().pack());
+                .get(entityChunkKey);
             if (holder == null
                 || holder.getEntityTickingChunkFuture()
                     .getNow(net.minecraft.server.level.ChunkHolder.UNLOADED_LEVEL_CHUNK)

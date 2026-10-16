@@ -222,7 +222,7 @@ public abstract class ServerChunkCacheRegioniumMixin {
                 net.minecraft.world.level.gamerules.GameRules.RANDOM_TICK_SPEED
             );
 
-            for (var chunk : List.copyOf(current.worldData().entityTickingChunks())) {
+            for (var chunk : List.copyOf(current.worldData().tickingChunks())) {
                 long packed = chunk.getPos().pack();
                 if (Regionium.scheduler().regionizer().owner(level, packed) != current) {
                     continue;

@@ -772,6 +772,14 @@ public final class RegioniumScheduler implements AutoCloseable {
                 }
 
                 long chunkKey = chunk.getPos().pack();
+                // Level.tickBlockEntities() gates every ticker with
+                // shouldTickBlocksAt(). Region-local ticker lists must preserve
+                // that simulation-distance check instead of ticking every
+                // loaded FULL chunk owned by this region.
+                if (!level.shouldTickBlocksAt(chunkKey)) {
+                    continue;
+                }
+
                 beginChunkExecution(level, chunkKey);
                 try {
                     synchronized (chunk) {

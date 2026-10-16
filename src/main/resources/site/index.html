@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta content="width=device-width, initial-scale=1" name="viewport">
+    <title>Regionium · Debug overlay</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+    <div class="brand">REGIONIUM <span class="sub">/ DEBUG OVERLAY</span></div>
+    <div class="status"><select aria-label="Dimension" id="dimension"></select><span class="dot"
+                                                                                    id="statusDot"></span><span
+            id="statusText">Connecting…</span><span>·</span><span id="host">localhost</span></div>
+</header>
+<main>
+    <section id="map">
+        <canvas aria-label="Chunk and region data received from the mod" id="canvas"></canvas>
+        <div class="controls">
+            <button id="fit">Fit view</button>
+            <button id="zoomIn">＋</button>
+            <button id="zoomOut">－</button>
+        </div>
+        <div id="message">Waiting for Regionium data…</div>
+    </section>
+    <aside>
+        <div class="sidegrid">
+            <section><h2>Overview</h2>
+                <div class="summary" id="summary"></div>
+            </section>
+            <section><h3>Regions</h3>
+                <div class="legend" id="legend"></div>
+            </section>
+            <section><h3>Players</h3>
+                <div class="legend" id="players"></div>
+            </section>
+            <section><h3>Selected data</h3>
+                <pre id="details">Select a chunk, section, or player.</pre>
+            </section>
+        </div>
+    </aside>
+</main>
+<script src="script.js"></script>
+</body>
+</html>

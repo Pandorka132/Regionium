@@ -28,6 +28,8 @@ public final class CarpetPlayerGameTests {
     private static final String TRANSFER_B = "RegioniumTransferB";
     private static final String TICK_A = "RegioniumTickA";
     private static final String TICK_B = "RegioniumTickB";
+    private static final String SIM_RANGE_A = "RegioniumSimRangeA";
+    private static final String SIM_RANGE_B = "RegioniumSimRangeB";
 
     private static final int DISTANT_BASE_X = 0;
     private static final int TRANSFER_BASE_X = 4096;
@@ -63,6 +65,85 @@ public final class CarpetPlayerGameTests {
                 }
             })
             .thenExecute(() -> cleanupPair(helper, DISTANT_A, DISTANT_B))
+            .thenSucceed();
+    }
+
+    @GameTest(maxTicks = 800)
+    public void regionTickSetsRespectSimulationDistance(GameTestHelper helper) {
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+
+        helper.startSequence()
+            .thenExecute(() -> {
+                killBot(helper, SIM_RANGE_A);
+                killBot(helper, SIM_RANGE_B);
+                runCommand(helper, "carpet allowSpawningOfflinePlayers true");
+                spawnPairAt(helper, SIM_RANGE_A, SIM_RANGE_B, 28672);
+            })
+            .thenWaitUntil(() -> waitForPairOwners(helper, SIM_RANGE_A, SIM_RANGE_B))
+            .thenIdle(40)
+            .thenExecute(() -> {
+                var level = helper.getLevel();
+                var distanceManager = level.getChunkSource().chunkMap.getDistanceManager();
+                int lazyChunks = 0;
+
+                for (RegioniumRegion region : Regionium.scheduler().regionizer().allRegions()) {
+                    if (region.level() != level) {
+                        continue;
+                    }
+
+                    var data = region.worldData();
+                    for (var chunk : data.chunks()) {
+                        long chunkKey = chunk.getPos().pack();
+                        boolean inBlockTickingRange = distanceManager.inBlockTickingRange(chunkKey);
+                        boolean inEntityTickingRange = distanceManager.inEntityTickingRange(chunkKey);
+                        boolean markedTicking = data.tickingChunks().contains(chunk);
+                        boolean markedEntityTicking = data.entityTickingChunks().contains(chunk);
+
+                        if (markedTicking != inBlockTickingRange) {
+                            throw helper.assertionException(
+                                "Region tick set disagrees with DistanceManager block-ticking range at "
+                                    + chunk.getPos() + ": inBlockTickingRange=" + inBlockTickingRange
+                                    + ", markedTicking=" + markedTicking
+                            );
+                        }
+                        if (markedEntityTicking != inEntityTickingRange) {
+                            throw helper.assertionException(
+                                "Region entity-tick set disagrees with DistanceManager entity-ticking range at "
+                                    + chunk.getPos() + ": inEntityTickingRange=" + inEntityTickingRange
+                                    + ", markedEntityTicking=" + markedEntityTicking
+                            );
+                        }
+                        if (inBlockTickingRange && !inEntityTickingRange) {
+                            lazyChunks++;
+                        }
+                    }
+
+                    for (var chunk : data.tickingChunks()) {
+                        if (!distanceManager.inBlockTickingRange(chunk.getPos().pack())) {
+                            throw helper.assertionException(
+                                "Region ticking set contains chunk outside block-ticking range: " + chunk.getPos()
+                            );
+                        }
+                    }
+
+                    for (var chunk : data.entityTickingChunks()) {
+                        if (!distanceManager.inEntityTickingRange(chunk.getPos().pack())) {
+                            throw helper.assertionException(
+                                "Region entity-ticking set contains chunk outside simulation range: "
+                                    + chunk.getPos()
+                            );
+                        }
+                    }
+                }
+
+                if (lazyChunks == 0) {
+                    throw helper.assertionException(
+                        "Test did not observe any block-ticking chunks outside the entity-ticking range"
+                    );
+                }
+            })
+            .thenExecute(() -> cleanupPair(helper, SIM_RANGE_A, SIM_RANGE_B))
             .thenSucceed();
     }
 
