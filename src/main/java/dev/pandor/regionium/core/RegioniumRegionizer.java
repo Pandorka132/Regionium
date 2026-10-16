@@ -130,9 +130,22 @@ public final class RegioniumRegionizer {
             if (state == null) return;
 
             long chunkKey = holder.getPos().pack();
-            ChunkHolder previous = state.chunkHolders.put(chunkKey, holder);
-            if (previous != holder && state.regionChunks.add(chunkKey)) {
-                state.topologyDirty = true;
+            if (isRegionChunk(holder)) {
+                ChunkHolder previous = state.chunkHolders.put(chunkKey, holder);
+                if (previous != holder && state.regionChunks.add(chunkKey)) {
+                    state.topologyDirty = true;
+                }
+                if (state.leasedChunks.add(chunkKey)) {
+                    state.topologyDirty = true;
+                }
+            } else {
+                state.chunkHolders.remove(chunkKey);
+                if (state.regionChunks.remove(chunkKey)) {
+                    state.topologyDirty = true;
+                }
+                if (state.leasedChunks.remove(chunkKey)) {
+                    state.topologyDirty = true;
+                }
             }
         } finally {
             lifecycleLock.tryUnlockWrite();
@@ -167,22 +180,29 @@ public final class RegioniumRegionizer {
             if (state == null) return;
 
             long chunkKey = holder.getPos().pack();
-            state.chunkHolders.put(chunkKey, holder);
 
-            // updateFutures() also runs for ticking/entity-ticking future
-            // changes. Those are simulation-state transitions, not spatial
-            // topology changes: Folia's regionizer is driven by holder
-            // creation/destruction. Rebalancing for every future update makes
-            // the server thread queue a global write lock continuously.
-            boolean loaded = net.minecraft.server.level.ChunkLevel.isLoaded(holder.getTicketLevel());
+            // ChunkLevel.isLoaded() includes generation-dependency holders well
+            // outside FULL chunks. Folia's spatial topology must include actual
+            // FULL chunk leases, including non-ticking FULL chunks, but not
+            // every holder needed only to generate a neighbouring chunk.
+            boolean leased = isRegionChunk(holder);
             boolean tracked = state.regionChunks.contains(chunkKey);
-            if (loaded && !tracked) {
-                state.regionChunks.add(chunkKey);
-                state.topologyDirty = true;
-            } else if (!loaded && tracked) {
-                state.regionChunks.remove(chunkKey);
-                state.leasedChunks.remove(chunkKey);
-                state.topologyDirty = true;
+            if (leased) {
+                state.chunkHolders.put(chunkKey, holder);
+                if (!tracked && state.regionChunks.add(chunkKey)) {
+                    state.topologyDirty = true;
+                }
+                if (state.leasedChunks.add(chunkKey)) {
+                    state.topologyDirty = true;
+                }
+            } else {
+                state.chunkHolders.remove(chunkKey);
+                if (state.regionChunks.remove(chunkKey)) {
+                    state.topologyDirty = true;
+                }
+                if (state.leasedChunks.remove(chunkKey)) {
+                    state.topologyDirty = true;
+                }
             }
         } finally {
             lifecycleLock.unlockWrite(stamp);
@@ -196,15 +216,23 @@ public final class RegioniumRegionizer {
         }
 
         long chunkKey = holder.getPos().pack();
-        state.chunkHolders.put(chunkKey, holder);
-
         boolean leased = isRegionChunk(holder);
         if (leased) {
+            state.chunkHolders.put(chunkKey, holder);
+            if (state.regionChunks.add(chunkKey)) {
+                state.topologyDirty = true;
+            }
             if (state.leasedChunks.add(chunkKey)) {
                 state.topologyDirty = true;
             }
-        } else if (state.leasedChunks.remove(chunkKey)) {
-            state.topologyDirty = true;
+        } else {
+            state.chunkHolders.remove(chunkKey);
+            if (state.regionChunks.remove(chunkKey)) {
+                state.topologyDirty = true;
+            }
+            if (state.leasedChunks.remove(chunkKey)) {
+                state.topologyDirty = true;
+            }
         }
 
         // Region-local chunk state is reconciled by the owning region thread.
@@ -250,15 +278,16 @@ public final class RegioniumRegionizer {
         }
 
         /*
-         * ChunkMap's visible map is the lifecycle snapshot for the current
-         * render-distance topology. The explicit holder callbacks are useful
-         * for dirtying the regionizer, but they cannot be the sole source of
-         * removal state: vanilla can keep/recycle a ChunkHolder while its
-         * ticket crosses the loaded boundary. Reconcile the persistent set
-         * against the actual loaded visible holders on every topology pass.
+         * ChunkMap's visible map is the lifecycle snapshot for holder state,
+         * but ChunkLevel.isLoaded() includes generation-dependency holders
+         * beyond FULL chunks. Region topology must include leased FULL chunks
+         * (including non-ticking chunks), not every holder needed to generate
+         * a neighbouring chunk. Reconcile against the current FULL ticket
+         * status so stale/recycled holders cannot keep regions connected.
          *
-         * This is still Folia's holder/section topology model: ownership is
-         * not derived from player coordinates or simulation distance.
+         * This follows Folia's persistent holder/section topology model:
+         * ownership is not derived from player coordinates or simulation
+         * distance.
          */
         Map<Long, ChunkHolder> visible =
             ((ChunkMapRegioniumVisibleAccessorMixin) level.getChunkSource().chunkMap)
@@ -266,10 +295,9 @@ public final class RegioniumRegionizer {
 
         Map<Long, ChunkHolder> liveHolders = new LinkedHashMap<>();
         for (ChunkHolder holder : visible.values()) {
-            // visibleChunkMap can retain a holder while its ticket is already
-            // below the loaded threshold. Such a holder is not part of the
-            // render-distance topology and must not reconnect two regions.
-            if (!net.minecraft.server.level.ChunkLevel.isLoaded(holder.getTicketLevel())) {
+            // isLoaded() is deliberately broader than FULL: it includes
+            // generation dependencies and creates a large false topology halo.
+            if (!isRegionChunk(holder)) {
                 continue;
             }
 
@@ -424,17 +452,9 @@ public final class RegioniumRegionizer {
     }
 
     private static boolean isRegionChunk(ChunkHolder holder) {
-        if (holder == null) {
-            return false;
-        }
-
-        if (holder.getTickingChunk() != null) {
-            return true;
-        }
-
-        return holder.getEntityTickingChunkFuture()
-            .getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK)
-            .orElse(null) != null;
+        return holder != null
+            && net.minecraft.server.level.ChunkLevel.fullStatus(holder.getTicketLevel())
+                .isOrAfter(net.minecraft.server.level.FullChunkStatus.FULL);
     }
 
     private static RegioniumRegion findEntityRegion(
@@ -581,8 +601,6 @@ public final class RegioniumRegionizer {
             if (!data.hasChunk(chunk)) {
                 data.addChunk(chunk);
             }
-            data.setTickingChunk(chunk, true);
-
             ChunkHolder holder;
             stamp = lifecycleLock.readLock();
             try {
@@ -590,12 +608,18 @@ public final class RegioniumRegionizer {
             } finally {
                 lifecycleLock.unlockRead(stamp);
             }
+            long chunkKey = chunk.getPos().pack();
+            var distanceManager = region.level().getChunkSource().chunkMap.getDistanceManager();
+            boolean inBlockTickingRange = distanceManager.inBlockTickingRange(chunkKey);
+            boolean inEntityTickingRange = distanceManager.inEntityTickingRange(chunkKey);
+            data.setTickingChunk(chunk, inBlockTickingRange);
+
             LevelChunk entityTicking = holder == null
                 ? null
                 : holder.getEntityTickingChunkFuture()
                     .getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK)
                     .orElse(null);
-            data.setEntityTickingChunk(chunk, chunk == entityTicking);
+            data.setEntityTickingChunk(chunk, inEntityTickingRange && chunk == entityTicking);
         }
 
         // PlayerList.placeNewPlayer can run before chunk topology exists. Keep
@@ -797,6 +821,65 @@ public final class RegioniumRegionizer {
         return state == null ? List.of() : List.copyOf(state.regions);
     }
 
+    /**
+     * Takes an immutable view of the current holder topology for diagnostics.
+     * This reports the published owner map rather than deriving regions from
+     * player positions or simulation distances.
+     */
+    public List<DebugChunk> debugChunks(ServerLevel level) {
+        long stamp = lifecycleLock.readLock();
+        try {
+            LevelState state = worlds.get(level);
+            if (state == null) {
+                return List.of();
+            }
+
+            Map<Long, RegioniumRegion> owners = state.chunkOwners;
+            List<DebugChunk> result = new ArrayList<>();
+            for (Map.Entry<Long, ChunkHolder> entry : state.chunkHolders.entrySet()) {
+                ChunkHolder holder = entry.getValue();
+                if (!isRegionChunk(holder)) {
+                    continue;
+                }
+
+                long chunkKey = entry.getKey();
+                int chunkX = ChunkPos.getX(chunkKey);
+                int chunkZ = ChunkPos.getZ(chunkKey);
+
+                RegioniumRegion owner = owners.get(chunkKey);
+                LevelChunk entityTickingChunk = holder.getEntityTickingChunkFuture()
+                    .getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK)
+                    .orElse(null);
+                var distanceManager = level.getChunkSource().chunkMap.getDistanceManager();
+                boolean inBlockTickingRange = distanceManager.inBlockTickingRange(chunkKey);
+                boolean inEntityTickingRange = distanceManager.inEntityTickingRange(chunkKey);
+                result.add(new DebugChunk(
+                    chunkX,
+                    chunkZ,
+                    chunkX >> REGION_SECTION_SHIFT,
+                    chunkZ >> REGION_SECTION_SHIFT,
+                    owner == null ? null : owner.id(),
+                    inBlockTickingRange && holder.getTickingChunk() != null,
+                    inEntityTickingRange && entityTickingChunk != null
+                ));
+            }
+            result.sort(Comparator.comparingInt(DebugChunk::x).thenComparingInt(DebugChunk::z));
+            return List.copyOf(result);
+        } finally {
+            lifecycleLock.unlockRead(stamp);
+        }
+    }
+
+    public record DebugChunk(
+        int x,
+        int z,
+        int sectionX,
+        int sectionZ,
+        Long regionId,
+        boolean ticking,
+        boolean entityTicking
+    ) {}
+
     public Set<RegioniumRegion> activeRegions() {
         Set<RegioniumRegion> result =
             Collections.newSetFromMap(new IdentityHashMap<>());
@@ -954,12 +1037,15 @@ public final class RegioniumRegionizer {
             if (destinationData != null && authoritativeChunk != null) {
                 RegioniumWorldData.shiftScheduledTicks(authoritativeChunk, tickTimeOffset);
                 destinationData.addChunk(authoritativeChunk);
-                destinationData.setTickingChunk(authoritativeChunk, true);
+                var distanceManager = source.level().getChunkSource().chunkMap.getDistanceManager();
+                boolean inBlockTickingRange = distanceManager.inBlockTickingRange(chunkKey);
+                boolean inEntityTickingRange = distanceManager.inEntityTickingRange(chunkKey);
+                destinationData.setTickingChunk(authoritativeChunk, inBlockTickingRange);
                 LevelChunk entityTickingChunk = holder.getEntityTickingChunkFuture()
                     .getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK)
                     .orElse(null);
                 destinationData.setEntityTickingChunk(
-                    authoritativeChunk, authoritativeChunk == entityTickingChunk
+                    authoritativeChunk, inEntityTickingRange && authoritativeChunk == entityTickingChunk
                 );
                 // addChunk normally flushes deferred ticks immediately on the
                 // owner thread. Topology migration runs under the global write

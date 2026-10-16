@@ -73,11 +73,14 @@ public final class RegioniumWorldData {
         this.region = region;
         this.redstoneTime = level.getLevelData().getGameTime();
 
+        // Match Folia's RegionizedWorldData: ownership alone does not make a
+        // scheduled tick eligible to run. The vanilla predicate also checks
+        // entity loading and the DistanceManager's simulation ticking range.
         this.blockTicks = new LevelTicks<>(
-            pos -> ownsChunk(pos)
+            pos -> ownsChunk(pos) && level.isPositionTickingWithEntitiesLoaded(pos)
         );
         this.fluidTicks = new LevelTicks<>(
-            pos -> ownsChunk(pos)
+            pos -> ownsChunk(pos) && level.isPositionTickingWithEntitiesLoaded(pos)
         );
         this.neighborUpdater = new CollectingNeighborUpdater(
             level,

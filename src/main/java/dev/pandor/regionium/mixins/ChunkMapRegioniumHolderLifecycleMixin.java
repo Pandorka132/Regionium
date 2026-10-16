@@ -25,13 +25,15 @@ public abstract class ChunkMapRegioniumHolderLifecycleMixin {
         }
 
         var level = ((ChunkMapRegioniumVisibleAccessorMixin) (Object) this).regionium$getLevel();
-        if (net.minecraft.server.level.ChunkLevel.isLoaded(newTicketLevel)) {
-            // ChunkHolder lifecycle is the authoritative render-distance topology.
-            // Re-add even when the same holder is reused after an unload transition.
+        if (net.minecraft.server.level.ChunkLevel.fullStatus(newTicketLevel)
+            .isOrAfter(net.minecraft.server.level.FullChunkStatus.FULL)) {
+            // Only FULL chunk leases belong to spatial topology. ChunkLevel.isLoaded()
+            // also includes generation-only dependency holders outside this area.
+            // Re-add when the same holder is promoted after a lower ticket level.
             Regionium.scheduler().regionizer().addChunkHolder(level, holder);
         } else {
-            // Do not keep an unloaded holder as a bridge between otherwise
-            // disconnected render-distance regions.
+            // A retained generation holder is not a leased world chunk and must
+            // not bridge otherwise disconnected regions.
             Regionium.scheduler().regionizer().removeChunkHolder(level, holder.getPos().pack());
         }
     }
