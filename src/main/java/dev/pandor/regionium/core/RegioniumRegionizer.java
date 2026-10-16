@@ -52,6 +52,10 @@ public final class RegioniumRegionizer {
     // read side while that writer is queued. A fair lock turns one slow region
     // into a global tick barrier.
     private final ReentrantReadWriteLock regionTickBarrier = new ReentrantReadWriteLock(false);
+    // Stop admitting new region ticks while a dirty topology waits for the
+    // current readers to drain; otherwise independently scheduled regions can
+    // keep overlapping and starve the non-blocking topology writer forever.
+    private volatile boolean topologyWritePending;
     private final Function<ServerLevel, RegioniumRegion> regionFactory;
 
     public RegioniumRegionizer(Function<ServerLevel, RegioniumRegion> regionFactory) {
@@ -64,7 +68,18 @@ public final class RegioniumRegionizer {
      * a region is mutating chunks selected from the previous snapshot.
      */
     public void enterRegionTick() {
-        regionTickBarrier.readLock().lock();
+        while (true) {
+            while (topologyWritePending) {
+                LockSupport.parkNanos(100_000L);
+            }
+
+            regionTickBarrier.readLock().lock();
+            // Close the race between checking the gate and acquiring the lock.
+            if (!topologyWritePending) {
+                return;
+            }
+            regionTickBarrier.readLock().unlock();
+        }
     }
 
     public void exitRegionTick() {
@@ -109,6 +124,7 @@ public final class RegioniumRegionizer {
 
     public void unregisterLevel(ServerLevel level) {
         worlds.remove(level);
+        refreshTopologyWritePending();
     }
 
     public void markTopologyDirty(ServerLevel level) {
@@ -252,6 +268,7 @@ public final class RegioniumRegionizer {
         // can prevent unrelated region ticks from acquiring the read lock. If
         // any region is still ticking, leave topologyDirty set and retry on the
         // next global server tick instead of turning this into a global stall.
+        topologyWritePending = true;
         if (!regionTickBarrier.writeLock().tryLock()) {
             return;
         }
@@ -268,6 +285,20 @@ public final class RegioniumRegionizer {
             }
         } finally {
             regionTickBarrier.writeLock().unlock();
+            refreshTopologyWritePending();
+        }
+    }
+
+    /** Keep the gate raised until every registered level has a clean topology. */
+    private void refreshTopologyWritePending() {
+        synchronized (worlds) {
+            for (LevelState state : worlds.values()) {
+                if (state.topologyDirty) {
+                    topologyWritePending = true;
+                    return;
+                }
+            }
+            topologyWritePending = false;
         }
     }
 
@@ -327,7 +358,7 @@ public final class RegioniumRegionizer {
             // Publish the empty topology while the lifecycle write lock and
             // region-tick barrier are held, then synchronously clear and retire
             // every former region. Inactive regions must not retain ownership.
-            state.chunkOwners = Map.of();
+            state.sectionOwners = Map.of();
             state.active = Set.of();
             for (RegioniumRegion region : List.copyOf(state.regions)) {
                 region.stopScheduledTickLoop();
@@ -338,13 +369,16 @@ public final class RegioniumRegionizer {
             return;
         }
 
+        // Only sections containing at least one leased FULL chunk participate
+        // in the topology. Non-FULL chunks and empty neighbouring sections do
+        // not independently create or retain an owner.
         List<Set<Long>> components = connectedComponents(currentSections);
         components.sort(Comparator
             .<Set<Long>>comparingInt(Set::size)
             .reversed()
             .thenComparingLong(set -> set.iterator().next()));
 
-        Map<Long, RegioniumRegion> oldOwners = new LinkedHashMap<>(state.chunkOwners);
+        Map<Long, RegioniumRegion> oldOwners = new LinkedHashMap<>(state.sectionOwners);
         Set<RegioniumRegion> used = Collections.newSetFromMap(new IdentityHashMap<>());
         Map<Long, RegioniumRegion> nextOwners = new LinkedHashMap<>();
 
@@ -360,27 +394,16 @@ public final class RegioniumRegionizer {
 
             used.add(selected);
             for (long section : component) {
-                int sectionX = sectionX(section);
-                int sectionZ = sectionZ(section);
-
-                for (int dz = 0; dz < (1 << REGION_SECTION_SHIFT); ++dz) {
-                    for (int dx = 0; dx < (1 << REGION_SECTION_SHIFT); ++dx) {
-                        long chunk = ChunkPos.pack(
-                            (sectionX << REGION_SECTION_SHIFT) + dx,
-                            (sectionZ << REGION_SECTION_SHIFT) + dz
-                        );
-                        if (currentChunks.contains(chunk)) {
-                            nextOwners.put(chunk, selected);
-                        }
-                    }
-                }
+                // Ownership is recorded once per 8x8 region section. Chunk
+                // coordinates are translated to this key only at lookup time.
+                nextOwners.put(section, selected);
             }
         }
 
         // Publish the next topology under the lifecycle write lock. The tick
         // barrier is still held, so no region can observe this snapshot until
         // every region-local container/entity has been moved to its new owner.
-        state.chunkOwners = Map.copyOf(nextOwners);
+        state.sectionOwners = Map.copyOf(nextOwners);
         state.active = Set.copyOf(used);
 
         for (RegioniumRegion region : List.copyOf(state.regions)) {
@@ -428,7 +451,7 @@ public final class RegioniumRegionizer {
                 continue;
             }
 
-            RegioniumRegion destination = state.chunkOwners.get(entity.chunkPosition().pack());
+            RegioniumRegion destination = ownerForChunk(state.sectionOwners, entity.chunkPosition().pack());
             if (destination == null) {
                 continue;
             }
@@ -477,21 +500,10 @@ public final class RegioniumRegionizer {
     ) {
         Map<RegioniumRegion, Integer> scores = new IdentityHashMap<>();
 
-        for (long chunk : component) {
-            int baseX = sectionX(chunk);
-            int baseZ = sectionZ(chunk);
-
-            for (int dz = 0; dz < (1 << REGION_SECTION_SHIFT); ++dz) {
-                for (int dx = 0; dx < (1 << REGION_SECTION_SHIFT); ++dx) {
-                    long chunkKey = ChunkPos.pack(
-                        (baseX << REGION_SECTION_SHIFT) + dx,
-                        (baseZ << REGION_SECTION_SHIFT) + dz
-                    );
-                    RegioniumRegion owner = oldOwners.get(chunkKey);
-                    if (owner != null && !used.contains(owner)) {
-                        scores.merge(owner, 1, Integer::sum);
-                    }
-                }
+        for (long section : component) {
+            RegioniumRegion owner = oldOwners.get(section);
+            if (owner != null && !used.contains(owner)) {
+                scores.merge(owner, 1, Integer::sum);
             }
         }
 
@@ -569,15 +581,14 @@ public final class RegioniumRegionizer {
         List<LevelChunk> desiredChunks = new ArrayList<>();
         long stamp = lifecycleLock.readLock();
         try {
-            for (Map.Entry<Long, RegioniumRegion> entry : state.chunkOwners.entrySet()) {
-                if (entry.getValue() != region) {
+            // Iterate actual holders; the ownership map is keyed by region
+            // section and must not be mistaken for a chunk-holder registry.
+            for (Map.Entry<Long, ChunkHolder> entry : state.chunkHolders.entrySet()) {
+                long chunkKey = entry.getKey();
+                if (ownerForChunk(state.sectionOwners, chunkKey) != region) {
                     continue;
                 }
-                ChunkHolder holder = state.chunkHolders.get(entry.getKey());
-                if (holder == null) {
-                    continue;
-                }
-                LevelChunk chunk = holder.getTickingChunk();
+                LevelChunk chunk = entry.getValue().getTickingChunk();
                 if (chunk != null) {
                     desiredChunks.add(chunk);
                 }
@@ -688,7 +699,7 @@ public final class RegioniumRegionizer {
         }
 
         long chunkKey = entity.chunkPosition().pack();
-        RegioniumRegion destination = state.chunkOwners.get(chunkKey);
+        RegioniumRegion destination = ownerForChunk(state.sectionOwners, chunkKey);
         RegioniumRegion source = findEntityRegion(state.regions, entity);
 
         if (destination == null || source == destination) {
@@ -734,7 +745,7 @@ public final class RegioniumRegionizer {
         }
 
         long chunkKey = entity.chunkPosition().pack();
-        RegioniumRegion destination = state.chunkOwners.get(chunkKey);
+        RegioniumRegion destination = ownerForChunk(state.sectionOwners, chunkKey);
         RegioniumRegion source = findEntityRegion(state.regions, entity);
 
         if (destination == null) {
@@ -773,17 +784,17 @@ public final class RegioniumRegionizer {
     public RegioniumRegion owner(ServerLevel level, long chunkKey) {
         long optimistic = lifecycleLock.tryOptimisticRead();
         LevelState state = worlds.get(level);
-        RegioniumRegion result = state == null ? null : state.chunkOwners.get(chunkKey);
+        RegioniumRegion result = state == null ? null : ownerForChunk(state.sectionOwners, chunkKey);
         if (lifecycleLock.validate(optimistic)) {
             return result;
         }
 
-        lifecycleLock.readLock();
+        long stamp = lifecycleLock.readLock();
         try {
             state = worlds.get(level);
-            return state == null ? null : state.chunkOwners.get(chunkKey);
+            return state == null ? null : ownerForChunk(state.sectionOwners, chunkKey);
         } finally {
-            lifecycleLock.tryUnlockRead();
+            lifecycleLock.unlockRead(stamp);
         }
     }
 
@@ -834,7 +845,7 @@ public final class RegioniumRegionizer {
                 return List.of();
             }
 
-            Map<Long, RegioniumRegion> owners = state.chunkOwners;
+            Map<Long, RegioniumRegion> owners = state.sectionOwners;
             List<DebugChunk> result = new ArrayList<>();
             for (Map.Entry<Long, ChunkHolder> entry : state.chunkHolders.entrySet()) {
                 ChunkHolder holder = entry.getValue();
@@ -846,7 +857,7 @@ public final class RegioniumRegionizer {
                 int chunkX = ChunkPos.getX(chunkKey);
                 int chunkZ = ChunkPos.getZ(chunkKey);
 
-                RegioniumRegion owner = owners.get(chunkKey);
+                RegioniumRegion owner = ownerForChunk(owners, chunkKey);
                 LevelChunk entityTickingChunk = holder.getEntityTickingChunkFuture()
                     .getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK)
                     .orElse(null);
@@ -906,7 +917,7 @@ public final class RegioniumRegionizer {
 
         // Block events have positions but are not tied to a live chunk holder.
         for (BlockEventData event : sourceData.drainBlockEvents()) {
-            RegioniumRegion destination = nextOwners.get(ChunkPos.pack(
+            RegioniumRegion destination = ownerForChunk(nextOwners, ChunkPos.pack(
                 event.pos().getX() >> 4, event.pos().getZ() >> 4
             ));
             if (destination != null) {
@@ -918,7 +929,7 @@ public final class RegioniumRegionizer {
         // present in more than one old world-data set after a merge; identity
         // sets plus the destination check make this migration idempotent.
         for (Entity entity : List.copyOf(sourceData.entities())) {
-            RegioniumRegion destination = nextOwners.get(entity.chunkPosition().pack());
+            RegioniumRegion destination = ownerForChunk(nextOwners, entity.chunkPosition().pack());
             if (destination == source) {
                 if (entity instanceof ServerPlayer player) {
                     ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
@@ -946,7 +957,7 @@ public final class RegioniumRegionizer {
         // transfer; RegionizedWorldData.add/remove normally keep these sets in
         // sync, but topology migration must not depend on that invariant.
         for (ServerPlayer player : List.copyOf(sourceData.players())) {
-            RegioniumRegion destination = nextOwners.get(player.chunkPosition().pack());
+            RegioniumRegion destination = ownerForChunk(nextOwners, player.chunkPosition().pack());
             if (destination == source) {
                 ((dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess) (Object) player)
                     .regionium$updateRegion(sourceData);
@@ -972,7 +983,7 @@ public final class RegioniumRegionizer {
         for (net.minecraft.world.level.block.entity.TickingBlockEntity ticker
             : List.copyOf(sourceData.blockEntityTickers())) {
             long tickerChunk = ChunkPos.containing(ticker.getPos()).pack();
-            RegioniumRegion destination = nextOwners.get(tickerChunk);
+            RegioniumRegion destination = ownerForChunk(nextOwners, tickerChunk);
             if (destination == source) {
                 continue;
             }
@@ -984,7 +995,7 @@ public final class RegioniumRegionizer {
         for (net.minecraft.world.level.block.entity.TickingBlockEntity ticker
             : List.copyOf(sourceData.pendingBlockEntityTickers())) {
             long tickerChunk = ChunkPos.containing(ticker.getPos()).pack();
-            RegioniumRegion destination = nextOwners.get(tickerChunk);
+            RegioniumRegion destination = ownerForChunk(nextOwners, tickerChunk);
             if (destination == source) {
                 continue;
             }
@@ -1001,7 +1012,7 @@ public final class RegioniumRegionizer {
         // remove/re-add that registration to restore its onTickAdded callback.
         for (LevelChunk chunk : List.copyOf(sourceData.chunks())) {
             long chunkKey = chunk.getPos().pack();
-            RegioniumRegion destination = nextOwners.get(chunkKey);
+            RegioniumRegion destination = ownerForChunk(nextOwners, chunkKey);
             if (destination == source) {
                 continue;
             }
@@ -1067,7 +1078,7 @@ public final class RegioniumRegionizer {
             BlockPos togglePos = ((dev.pandor.regionium.mixins.RedstoneTorchToggleRegioniumAccessorMixin)
                 (Object) toggle).regionium$getPos();
             long toggleChunk = ChunkPos.pack(togglePos);
-            RegioniumRegion destination = nextOwners.get(toggleChunk);
+            RegioniumRegion destination = ownerForChunk(nextOwners, toggleChunk);
             if (destination == source) {
                 continue;
             }
@@ -1084,7 +1095,7 @@ public final class RegioniumRegionizer {
         }
 
         for (ChunkHolder holder : List.copyOf(sourceData.chunkHoldersToBroadcast())) {
-            RegioniumRegion destination = nextOwners.get(holder.getPos().pack());
+            RegioniumRegion destination = ownerForChunk(nextOwners, holder.getPos().pack());
             if (destination == source) {
                 continue;
             }
@@ -1103,6 +1114,16 @@ public final class RegioniumRegionizer {
         }
     }
 
+    private static RegioniumRegion ownerForChunk(
+        Map<Long, RegioniumRegion> sectionOwners,
+        long chunkKey
+    ) {
+        return sectionOwners.get(sectionKey(
+            ChunkPos.getX(chunkKey) >> REGION_SECTION_SHIFT,
+            ChunkPos.getZ(chunkKey) >> REGION_SECTION_SHIFT
+        ));
+    }
+
     private static long sectionKey(int sectionX, int sectionZ) {
         return ChunkPos.pack(sectionX, sectionZ);
     }
@@ -1118,7 +1139,7 @@ public final class RegioniumRegionizer {
     private static final class LevelState {
         private final ServerLevel level;
         private final List<RegioniumRegion> regions = new ArrayList<>();
-        private volatile Map<Long, RegioniumRegion> chunkOwners = Map.of();
+        private volatile Map<Long, RegioniumRegion> sectionOwners = Map.of();
         private final Map<Long, ChunkHolder> chunkHolders = new ConcurrentHashMap<>();
         /** Persistent region topology: one owner for every existing holder. */
         private final Set<Long> regionChunks = new LinkedHashSet<>();

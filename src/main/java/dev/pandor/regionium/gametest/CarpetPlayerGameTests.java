@@ -36,6 +36,53 @@ public final class CarpetPlayerGameTests {
     private static final int TICK_BASE_X = 8192;
     private static final int FAR_OFFSET = 1280;
 
+    @GameTest(maxTicks = 200)
+    public void regionOwnershipIsSectionBasedAndEmptySectionsStayUnowned(GameTestHelper helper) {
+        var level = helper.getLevel();
+        var regionizer = Regionium.scheduler().regionizer();
+        Regionium.scheduler().registerLevel(level);
+        Regionium.scheduler().refreshChunkLeases(level);
+
+        BlockPos pos = helper.absolutePos(new BlockPos(1, 1, 1));
+        int chunkX = pos.getX() >> 4;
+        int chunkZ = pos.getZ() >> 4;
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                if (regionizer.owner(level, chunkX, chunkZ) == null) {
+                    throw helper.assertionException("Waiting for the test chunk to acquire a region owner");
+                }
+            })
+            .thenExecute(() -> {
+                RegioniumRegion expected = regionizer.owner(level, chunkX, chunkZ);
+                if (expected == null || regionizer.owner(level, chunkX + 1, chunkZ) != expected) {
+                    throw helper.assertionException(
+                        "Chunks in the same 8x8 region section must resolve to the same section owner");
+                }
+
+                // This section is deliberately far outside the test's loaded FULL holders.
+                int emptySectionChunkX = chunkX + (8 * 1024);
+                if (regionizer.owner(level, emptySectionChunkX, chunkZ) != null) {
+                    throw helper.assertionException(
+                        "An empty region section without a FULL holder must not retain an owner");
+                }
+
+                var visible = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+                    (Object) level.getChunkSource().chunkMap).regionium$getVisibleChunkMap();
+                for (var holder : visible.values()) {
+                    if (net.minecraft.server.level.ChunkLevel.fullStatus(holder.getTicketLevel())
+                            .isOrAfter(net.minecraft.server.level.FullChunkStatus.FULL)
+                        && regionizer.owner(level, holder.getPos().pack()) == null) {
+                        throw helper.assertionException(
+                            "FULL chunk has no region owner: " + holder.getPos()
+                                + ", ticketLevel=" + holder.getTicketLevel()
+                        );
+                    }
+                }
+            })
+            .thenSucceed();
+    }
+
     @GameTest(maxTicks = 1000)
     public void distantCarpetPlayersCreateSeparateRegions(GameTestHelper helper) {
         Regionium.scheduler().registerLevel(helper.getLevel());

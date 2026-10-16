@@ -48,6 +48,7 @@ replay_*.log
 
 # Local upstream Folia reference (not part of Regionium)
 .folia-reference/
+.folia-upstream
 
 projekt.md
 .env

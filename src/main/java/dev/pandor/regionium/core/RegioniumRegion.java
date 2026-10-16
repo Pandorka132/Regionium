@@ -174,6 +174,11 @@ public final class RegioniumRegion {
         try {
             Regionium.scheduler().regionizer().enterRegionTick();
             regionLockEntered = true;
+            // A topology rebuild may retire this region while it waits behind
+            // the admission gate. Do not execute one stale tick after waking.
+            if (retired.get()) {
+                return;
+            }
             RegioniumContext.enter(this);
             contextEntered = true;
             Regionium.scheduler().regionizer().reconcileRegion(this);
