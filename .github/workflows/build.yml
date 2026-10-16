@@ -71,7 +71,7 @@ jobs:
 
       - name: "🧪 Run Dev Build"
         if: ${{ steps.get-next-version.outputs.new_release_published != 'true' }}
-        run: ./gradlew runGameTestServer buildAndCollect -Pregionium.carpetTests --stacktrace
+        run: ./gradlew runGameTestServer buildAndCollect -Pregionium.carpetTests --scan --stacktrace
 
       - name: "🏗️ Build, Test & Release"
         if: ${{ steps.get-next-version.outputs.new_release_published == 'true' }}
