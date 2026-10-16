@@ -8,6 +8,9 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ChunkResult;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -24,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Future;
 import java.util.concurrent.ExecutionException;
@@ -834,6 +838,47 @@ public final class RegioniumScheduler implements AutoCloseable {
             if (ownerOf(object) == owner) {
                 action.run();
             }
+        });
+    }
+
+    /**
+     * Requests a square of chunks asynchronously without blocking a region
+     * worker. Returned chunk references must only be used for scheduling and
+     * status checks; world-state reads and mutations still belong on the
+     * region owning each chunk.
+     */
+    public CompletableFuture<List<ChunkAccess>> prepareChunksAsync(
+        ServerLevel level,
+        net.minecraft.core.BlockPos center,
+        int radius,
+        ChunkStatus status
+    ) {
+        Objects.requireNonNull(level, "level");
+        Objects.requireNonNull(center, "center");
+        Objects.requireNonNull(status, "status");
+        if (radius < 0) {
+            throw new IllegalArgumentException("radius must be non-negative");
+        }
+
+        ChunkPos centerChunk = ChunkPos.containing(center);
+        List<CompletableFuture<ChunkResult<ChunkAccess>>> futures = new ArrayList<>();
+        for (int x = centerChunk.x() - radius; x <= centerChunk.x() + radius; x++) {
+            for (int z = centerChunk.z() - radius; z <= centerChunk.z() + radius; z++) {
+                futures.add(level.getChunkSource().getChunkFuture(x, z, status, true));
+            }
+        }
+
+        CompletableFuture<?>[] all = futures.toArray(CompletableFuture[]::new);
+        return CompletableFuture.allOf(all).thenApply(ignored -> {
+            List<ChunkAccess> chunks = new ArrayList<>(futures.size());
+            for (CompletableFuture<ChunkResult<ChunkAccess>> future : futures) {
+                ChunkAccess chunk = future.join().orElse(null);
+                if (chunk == null) {
+                    throw new IllegalStateException("Asynchronous chunk preparation failed in " + level.dimension());
+                }
+                chunks.add(chunk);
+            }
+            return List.copyOf(chunks);
         });
     }
 

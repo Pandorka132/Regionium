@@ -17,7 +17,9 @@ import net.minecraft.world.level.redstone.NeighborUpdater;
 import net.minecraft.world.level.redstone.Orientation;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.objectweb.asm.Opcodes;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.gen.Invoker;
 
@@ -26,6 +28,24 @@ import java.util.List;
 
 @Mixin(ServerLevel.class)
 public abstract class ServerLevelRegioniumRedstoneMixin {
+    /*
+     * Vanilla's guard is a world-global flag around navigation recomputation.
+     * Regionium can call sendBlockUpdated concurrently from independent region
+     * workers, so another region may observe the flag and report a false
+     * recursive-call error. Folia disables this same guard for region threading.
+     */
+    @Redirect(
+        method = "sendBlockUpdated(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/block/state/BlockState;I)V",
+        at = @At(
+            value = "FIELD",
+            target = "Lnet/minecraft/server/level/ServerLevel;isUpdatingNavigations:Z",
+            opcode = Opcodes.GETFIELD
+        )
+    )
+    private boolean regionium$ignoreGlobalNavigationUpdateGuard(ServerLevel level) {
+        return false;
+    }
+
     @Inject(
         method = "updateNeighborsAt(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/Block;)V",
         at = @At("HEAD"),
