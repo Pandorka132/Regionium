@@ -20,6 +20,9 @@
     "ServerChunkCacheRegioniumThreadMixin",
     "LevelRegioniumThreadMixin",
     "LevelNeighborShapeUpdaterRegioniumMixin",
+    "CollectingNeighborUpdaterMultiRegioniumMixin",
+    "CollectingNeighborUpdaterSimpleRegioniumMixin",
+    "CollectingNeighborUpdaterShapeRegioniumMixin",
     "EntityRegioniumThreadMixin",
     "EntityRegioniumTeleportMixin",
     "ServerLevelEntityLifecycleRegioniumMixin",
@@ -48,7 +51,20 @@
     "LevelChunkRegioniumTimeMixin",
     "ServerConnectionListenerRegioniumMixin",
     "ServerCommonPacketListenerRegioniumMixin",
-    "PlayerChunkSenderRegioniumMixin"
+    "PlayerChunkSenderRegioniumMixin",
+    "NetherPortalBlockRegioniumInvokerMixin",
+    "EntityRegioniumPortalMixin",
+    "EntityRegioniumPortalStateAccessorMixin",
+    "TheEndGatewayBlockEntityRegioniumInvokerMixin",
+    "ServerPlayerRegioniumPortalInvokerMixin",
+    "TheEndGatewayBlockEntityRegioniumAccessorMixin",
+    "ServerPlayerRegioniumPortalAccessorMixin",
+    "EntityRegioniumPortalInvokerMixin",
+    "ChunkMapRegioniumInvokerMixin",
+    "PortalForcerRegioniumMixin",
+    "TheEndGatewayBlockEntityRegioniumMixin",
+    "PortalRegioniumMixin",
+    "PortalRegioniumInvokerMixin"
   ],
   "injectors": {
     "defaultRequire": 1

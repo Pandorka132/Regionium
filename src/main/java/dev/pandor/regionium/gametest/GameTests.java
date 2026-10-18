@@ -4,6 +4,12 @@ import net.fabricmc.fabric.api.gametest.v1.GameTest;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.NetherPortalBlock;
+import net.minecraft.world.level.block.Portal;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.resources.Identifier;
@@ -24,6 +30,347 @@ public final class GameTests {
 
     public static void noop(GameTestHelper helper) {
         helper.succeed();
+    }
+
+    @GameTest(maxTicks = 4800)
+    public void endGatewayTransfersEntitiesAsynchronously(GameTestHelper helper) {
+        var source = helper.getLevel();
+        var end = source.getServer().getLevel(Level.END);
+        if (end == null) {
+            throw helper.assertionException("End dimension is unavailable in GameTestServer");
+        }
+
+        BlockPos gatewayPos = new BlockPos(10000, 80, 10000);
+        var pigType = BuiltInRegistries.ENTITY_TYPE.getValue(Identifier.fromNamespaceAndPath("minecraft", "pig"));
+        Entity pig = pigType.create(end, EntitySpawnReason.TRIGGERED);
+        if (pig == null) {
+            throw helper.assertionException("Could not create End gateway test entity");
+        }
+        pig.snapTo(gatewayPos.getX() + 0.5, gatewayPos.getY(), gatewayPos.getZ() + 0.5, 0.0F, 0.0F);
+        var entityUuid = pig.getUUID();
+
+        dev.pandor.regionium.Regionium.scheduler().withChunksAsync(end, gatewayPos, 2,
+            net.minecraft.world.level.chunk.status.ChunkStatus.FULL, loaded -> {
+                java.util.concurrent.CompletableFuture<Void> setup = new java.util.concurrent.CompletableFuture<>();
+                dev.pandor.regionium.Regionium.scheduler().execute(end, gatewayPos, () -> {
+                    try {
+                        end.setBlockAndUpdate(gatewayPos, Blocks.END_GATEWAY.defaultBlockState());
+                        if (!(end.getBlockEntity(gatewayPos) instanceof net.minecraft.world.level.block.entity.TheEndGatewayBlockEntity gateway)) {
+                            throw helper.assertionException("End gateway block entity was not created");
+                        }
+                        end.addFreshEntity(pig);
+                        pig.setAsInsidePortal((Portal) Blocks.END_GATEWAY, gatewayPos);
+                        ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
+                            .regionium$invokeHandlePortal();
+                        setup.complete(null);
+                    } catch (Throwable failure) {
+                        setup.completeExceptionally(failure);
+                    }
+                });
+                return setup;
+            }
+        );
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                Entity transferred = end.getEntity(entityUuid);
+                if (transferred == null || transferred == pig || transferred.isRemoved()) {
+                    throw helper.assertionException("Waiting for asynchronous End gateway transfer");
+                }
+                if (transferred.distanceToSqr(gatewayPos.getX(), gatewayPos.getY(), gatewayPos.getZ()) < 1000.0) {
+                    throw helper.assertionException("End gateway transfer did not move the entity to its exit");
+                }
+            })
+            .thenSucceed();
+    }
+
+    @GameTest(maxTicks = 2400)
+    public void endPortalTransfersEntitiesAsynchronously(GameTestHelper helper) {
+        var source = helper.getLevel();
+        BlockPos portalPos = helper.absolutePos(new BlockPos(2, 2, 6));
+        source.setBlockAndUpdate(portalPos, Blocks.END_PORTAL.defaultBlockState());
+
+        var pigType = BuiltInRegistries.ENTITY_TYPE.getValue(Identifier.fromNamespaceAndPath("minecraft", "pig"));
+        Entity pig = pigType.create(source, EntitySpawnReason.TRIGGERED);
+        if (pig == null) {
+            throw helper.assertionException("Could not create End portal test entity");
+        }
+        pig.snapTo(portalPos.getX() + 0.5, portalPos.getY(), portalPos.getZ() + 0.5, 0.0F, 0.0F);
+        source.addFreshEntity(pig);
+        var entityUuid = pig.getUUID();
+        var end = source.getServer().getLevel(Level.END);
+        if (end == null) {
+            throw helper.assertionException("End dimension is unavailable in GameTestServer");
+        }
+
+        dev.pandor.regionium.Regionium.scheduler().execute(source, portalPos, () -> {
+            pig.setAsInsidePortal((Portal) Blocks.END_PORTAL, portalPos);
+            ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
+                .regionium$invokeHandlePortal();
+        });
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                Entity transferred = end.getEntity(entityUuid);
+                if (transferred == null || transferred.isRemoved()) {
+                    throw helper.assertionException("Waiting for asynchronous End portal transfer");
+                }
+                if (transferred.level() != end) {
+                    throw helper.assertionException("End portal transfer left the entity in the wrong world");
+                }
+            })
+            .thenSucceed();
+    }
+
+    @GameTest(maxTicks = 2400)
+    public void endPortalReturnsNonPlayersToOverworldSpawn(GameTestHelper helper) {
+        var overworld = helper.getLevel();
+        var end = overworld.getServer().getLevel(Level.END);
+        if (end == null) {
+            throw helper.assertionException("End dimension is unavailable in GameTestServer");
+        }
+
+        BlockPos portalPos = new BlockPos(20000, 120, 20000);
+        var pigType = BuiltInRegistries.ENTITY_TYPE.getValue(
+            Identifier.fromNamespaceAndPath("minecraft", "pig"));
+        java.util.concurrent.atomic.AtomicReference<java.util.UUID> entityUuid =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Throwable> setupFailure =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+        dev.pandor.regionium.Regionium.scheduler().withChunksAsync(
+            end, portalPos, 1, net.minecraft.world.level.chunk.status.ChunkStatus.FULL, chunks -> {
+                java.util.concurrent.CompletableFuture<Void> setup = new java.util.concurrent.CompletableFuture<>();
+                dev.pandor.regionium.Regionium.scheduler().execute(end, portalPos, () -> {
+                    try {
+                        end.setBlockAndUpdate(portalPos, Blocks.END_PORTAL.defaultBlockState());
+                        Entity pig = pigType.create(end, EntitySpawnReason.TRIGGERED);
+                        if (pig == null) {
+                            throw new IllegalStateException("Could not create End return-portal test entity");
+                        }
+                        pig.snapTo(portalPos.getX() + 0.5, portalPos.getY(), portalPos.getZ() + 0.5, 0.0F, 0.0F);
+                        end.addFreshEntity(pig);
+                        entityUuid.set(pig.getUUID());
+                        pig.setAsInsidePortal((Portal) Blocks.END_PORTAL, portalPos);
+                        ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
+                            .regionium$invokeHandlePortal();
+                        setup.complete(null);
+                    } catch (Throwable failure) {
+                        setupFailure.set(failure);
+                        setup.completeExceptionally(failure);
+                    }
+                });
+                return setup;
+            }
+        ).whenComplete((ignored, failure) -> {
+            if (failure != null) {
+                setupFailure.set(failure);
+            }
+        });
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                Throwable failure = setupFailure.get();
+                if (failure != null) {
+                    throw helper.assertionException("Could not prepare End return-portal test: " + failure);
+                }
+                java.util.UUID uuid = entityUuid.get();
+                if (uuid == null) {
+                    throw helper.assertionException("Waiting for End return-portal test setup");
+                }
+                Entity transferred = overworld.getEntity(uuid);
+                if (transferred == null || transferred.isRemoved()) {
+                    throw helper.assertionException("Waiting for asynchronous End-to-Overworld portal transfer");
+                }
+                if (transferred.level() != overworld) {
+                    throw helper.assertionException("End portal returned the entity to the wrong dimension");
+                }
+            })
+            .thenSucceed();
+    }
+
+    @GameTest(maxTicks = 2400)
+    public void netherPortalReusesExistingDestinationPortalAsynchronously(GameTestHelper helper) {
+        var source = helper.getLevel();
+        // Keep this destination portal vertically separated from the other
+        // portal tests: all tests share one world and nether coordinate scaling
+        // would otherwise make their synthetic portals overlap.
+        BlockPos sourcePortal = helper.absolutePos(new BlockPos(2, 116, 2));
+        source.setBlockAndUpdate(sourcePortal, Blocks.NETHER_PORTAL.defaultBlockState()
+            .setValue(NetherPortalBlock.AXIS, Direction.Axis.X));
+
+        var nether = source.getServer().getLevel(Level.NETHER);
+        if (nether == null) {
+            throw helper.assertionException("Nether dimension is unavailable in GameTestServer");
+        }
+
+        double scale = net.minecraft.world.level.dimension.DimensionType.getTeleportationScale(
+            source.dimensionType(), nether.dimensionType());
+        BlockPos target = nether.getWorldBorder().clampToBounds(
+            (sourcePortal.getX() + 0.5) * scale,
+            sourcePortal.getY(),
+            (sourcePortal.getZ() + 0.5) * scale
+        ).offset(10, 0, 0);
+
+        var pigType = BuiltInRegistries.ENTITY_TYPE.getValue(
+            Identifier.fromNamespaceAndPath("minecraft", "pig"));
+        java.util.concurrent.atomic.AtomicReference<java.util.UUID> entityUuid =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Throwable> setupFailure =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+        dev.pandor.regionium.Regionium.scheduler().withChunksAsync(
+            nether, target, 2, net.minecraft.world.level.chunk.status.ChunkStatus.FULL, chunks -> {
+                java.util.concurrent.CompletableFuture<Void> placed = new java.util.concurrent.CompletableFuture<>();
+                dev.pandor.regionium.Regionium.scheduler().execute(nether, target, () -> {
+                    try {
+                        for (int dx = 0; dx < 2; dx++) {
+                            for (int dy = 0; dy < 3; dy++) {
+                                nether.setBlockAndUpdate(target.offset(dx, dy, 0),
+                                    Blocks.NETHER_PORTAL.defaultBlockState()
+                                        .setValue(NetherPortalBlock.AXIS, Direction.Axis.X));
+                            }
+                        }
+                        placed.complete(null);
+                    } catch (Throwable failure) {
+                        placed.completeExceptionally(failure);
+                    }
+                });
+                return placed;
+            }
+        ).whenComplete((ignored, failure) -> {
+            if (failure != null) {
+                setupFailure.set(failure);
+                return;
+            }
+            dev.pandor.regionium.Regionium.scheduler().execute(source, sourcePortal, () -> {
+                try {
+                    Entity pig = pigType.create(source, EntitySpawnReason.TRIGGERED);
+                    if (pig == null) {
+                        throw new IllegalStateException("Could not create existing-portal test entity");
+                    }
+                    pig.snapTo(sourcePortal.getX() + 0.5, sourcePortal.getY(),
+                        sourcePortal.getZ() + 0.5, 0.0F, 0.0F);
+                    source.addFreshEntity(pig);
+                    entityUuid.set(pig.getUUID());
+                    pig.setAsInsidePortal((Portal) Blocks.NETHER_PORTAL, sourcePortal);
+                    ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
+                        .regionium$invokeHandlePortal();
+                } catch (Throwable failureToStart) {
+                    setupFailure.set(failureToStart);
+                }
+            });
+        });
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                Throwable failure = setupFailure.get();
+                if (failure != null) {
+                    throw helper.assertionException("Could not prepare existing Nether portal test: " + failure);
+                }
+                java.util.UUID uuid = entityUuid.get();
+                if (uuid == null) {
+                    throw helper.assertionException("Waiting for existing Nether portal test setup");
+                }
+                Entity transferred = nether.getEntity(uuid);
+                if (transferred == null || transferred.isRemoved()) {
+                    throw helper.assertionException("Waiting for asynchronous existing Nether portal transfer");
+                }
+                double distance = transferred.distanceToSqr(target.getX(), target.getY(), target.getZ());
+                if (distance > 16.0) {
+                    throw helper.assertionException(
+                        "Entity did not use the existing destination portal; distance squared=" + distance);
+                }
+            })
+            .thenSucceed();
+    }
+
+    @GameTest(maxTicks = 2400)
+    public void netherPortalTransfersPassengerTreesAsynchronously(GameTestHelper helper) {
+        var source = helper.getLevel();
+        BlockPos portalPos = helper.absolutePos(new BlockPos(6, 2, 2));
+        source.setBlockAndUpdate(portalPos, Blocks.NETHER_PORTAL.defaultBlockState()
+            .setValue(NetherPortalBlock.AXIS, Direction.Axis.X));
+
+        var boatType = BuiltInRegistries.ENTITY_TYPE.getValue(Identifier.fromNamespaceAndPath("minecraft", "boat"));
+        var pigType = BuiltInRegistries.ENTITY_TYPE.getValue(Identifier.fromNamespaceAndPath("minecraft", "pig"));
+        Entity boat = boatType.create(source, EntitySpawnReason.TRIGGERED);
+        Entity pig = pigType.create(source, EntitySpawnReason.TRIGGERED);
+        if (boat == null || pig == null) {
+            throw helper.assertionException("Could not create portal passenger-tree test entities");
+        }
+        boat.snapTo(portalPos.getX() + 0.5, portalPos.getY(), portalPos.getZ() + 0.5, 0.0F, 0.0F);
+        pig.snapTo(portalPos.getX() + 0.5, portalPos.getY(), portalPos.getZ() + 0.5, 0.0F, 0.0F);
+        source.addFreshEntity(boat);
+        source.addFreshEntity(pig);
+        if (!pig.startRiding(boat, true, false)) {
+            throw helper.assertionException("Could not attach the test pig to its boat");
+        }
+
+        var boatUuid = boat.getUUID();
+        var pigUuid = pig.getUUID();
+        var nether = source.getServer().getLevel(Level.NETHER);
+        if (nether == null) {
+            throw helper.assertionException("Nether dimension is unavailable in GameTestServer");
+        }
+
+        dev.pandor.regionium.Regionium.scheduler().execute(source, portalPos, () -> {
+            boat.setAsInsidePortal((Portal) Blocks.NETHER_PORTAL, portalPos);
+            ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) boat)
+                .regionium$invokeHandlePortal();
+        });
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                Entity transferredBoat = nether.getEntity(boatUuid);
+                Entity transferredPig = nether.getEntity(pigUuid);
+                if (transferredBoat == null || transferredPig == null) {
+                    throw helper.assertionException("Waiting for asynchronous portal passenger-tree transfer");
+                }
+                if (transferredPig.getVehicle() != transferredBoat) {
+                    throw helper.assertionException("Portal transfer did not preserve the passenger relationship");
+                }
+            })
+            .thenSucceed();
+    }
+
+    @GameTest(maxTicks = 2400)
+    public void netherPortalTransfersEntitiesAsynchronously(GameTestHelper helper) {
+        var source = helper.getLevel();
+        BlockPos portalPos = helper.absolutePos(new BlockPos(2, 2, 2));
+        source.setBlockAndUpdate(portalPos, Blocks.NETHER_PORTAL.defaultBlockState()
+            .setValue(NetherPortalBlock.AXIS, Direction.Axis.X));
+
+        var pigType = BuiltInRegistries.ENTITY_TYPE.getValue(Identifier.fromNamespaceAndPath("minecraft", "pig"));
+        Entity pig = pigType.create(source, EntitySpawnReason.TRIGGERED);
+        if (pig == null) {
+            throw helper.assertionException("Could not create portal test entity");
+        }
+        pig.snapTo(portalPos.getX() + 0.5, portalPos.getY(), portalPos.getZ() + 0.5, 0.0F, 0.0F);
+        source.addFreshEntity(pig);
+        var entityUuid = pig.getUUID();
+        var nether = source.getServer().getLevel(Level.NETHER);
+        if (nether == null) {
+            throw helper.assertionException("Nether dimension is unavailable in GameTestServer");
+        }
+
+        dev.pandor.regionium.Regionium.scheduler().execute(source, portalPos, () -> {
+            pig.setAsInsidePortal((Portal) Blocks.NETHER_PORTAL, portalPos);
+            ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
+                .regionium$invokeHandlePortal();
+        });
+
+        helper.startSequence()
+            .thenWaitUntil(() -> {
+                Entity transferred = nether.getEntity(entityUuid);
+                if (transferred == null || transferred.isRemoved()) {
+                    throw helper.assertionException("Waiting for asynchronous nether portal transfer");
+                }
+                if (transferred.level() != nether) {
+                    throw helper.assertionException("Portal transfer left the entity in the wrong world");
+                }
+            })
+            .thenSucceed();
     }
 
     @GameTest(maxTicks = 1000)

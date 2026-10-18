@@ -53,6 +53,8 @@ public abstract class ServerLevelRegioniumRedstoneMixin {
     )
     private void regionium$updateNeighborsAt(BlockPos pos, Block block, CallbackInfo ci) {
         ServerLevel level = (ServerLevel) (Object) this;
+
+
         RegioniumRegion current = RegioniumContext.currentRegion();
         if (current == null || current.level() != level) {
             return;
@@ -79,6 +81,7 @@ public abstract class ServerLevelRegioniumRedstoneMixin {
         CallbackInfo ci
     ) {
         ServerLevel level = (ServerLevel) (Object) this;
+
         RegioniumRegion current = RegioniumContext.currentRegion();
         if (current == null || current.level() != level) {
             return;
@@ -127,6 +130,7 @@ public abstract class ServerLevelRegioniumRedstoneMixin {
     ) {
         ServerLevel level = (ServerLevel) (Object) this;
         RegioniumRegion current = RegioniumContext.currentRegion();
+
         if (current == null || current.level() != level) {
             return;
         }

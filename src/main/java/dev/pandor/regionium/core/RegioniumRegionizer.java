@@ -168,6 +168,27 @@ public final class RegioniumRegionizer {
         }
     }
 
+    /**
+     * Checks whether the exact chunk has a FULL holder without requesting or
+     * synchronously loading it. Section ownership alone is insufficient here:
+     * a region owns its 8x8 section, including positions whose chunks are not
+     * currently leased.
+     */
+    public boolean hasLoadedFullChunk(ServerLevel level, long chunkKey) {
+        long stamp = lifecycleLock.readLock();
+        try {
+            LevelState state = worlds.get(level);
+            if (state == null) {
+                return false;
+            }
+            ChunkHolder holder = state.chunkHolders.get(chunkKey);
+            return isRegionChunk(holder)
+                && holder.getChunkIfPresent(net.minecraft.world.level.chunk.status.ChunkStatus.FULL) != null;
+        } finally {
+            lifecycleLock.unlockRead(stamp);
+        }
+    }
+
     /** Removes a ChunkHolder at the actual vanilla unload boundary. */
     public void removeChunkHolder(ServerLevel level, long chunkKey) {
         long stamp = lifecycleLock.writeLock();
@@ -597,14 +618,19 @@ public final class RegioniumRegionizer {
             lifecycleLock.unlockRead(stamp);
         }
 
-        Set<Long> desiredKeys = new LinkedHashSet<>();
+        Map<Long, LevelChunk> desiredByKey = new LinkedHashMap<>();
         for (LevelChunk chunk : desiredChunks) {
-            desiredKeys.add(chunk.getPos().pack());
+            desiredByKey.put(chunk.getPos().pack(), chunk);
         }
 
         RegioniumWorldData data = region.worldData();
         for (LevelChunk chunk : List.copyOf(data.chunks())) {
-            if (!desiredKeys.contains(chunk.getPos().pack())) {
+            // A holder can replace its LevelChunk instance without changing the
+            // chunk key (for example during a FULL/entity-ticking transition).
+            // Key-only reconciliation retained the obsolete instance alongside
+            // the replacement, leaving ticking sets and LevelTicks containers
+            // attached to stale chunk state.
+            if (desiredByKey.get(chunk.getPos().pack()) != chunk) {
                 data.removeChunk(chunk);
             }
         }
@@ -625,12 +651,12 @@ public final class RegioniumRegionizer {
             boolean inEntityTickingRange = distanceManager.inEntityTickingRange(chunkKey);
             data.setTickingChunk(chunk, inBlockTickingRange);
 
-            LevelChunk entityTicking = holder == null
-                ? null
-                : holder.getEntityTickingChunkFuture()
-                    .getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK)
-                    .orElse(null);
-            data.setEntityTickingChunk(chunk, inEntityTickingRange && chunk == entityTicking);
+            // The holder's entity-ticking future may be a different LevelChunk
+            // instance while the holder transitions between FULL and
+            // ENTITY_TICKING. The chunk in `desiredChunks` is the region's
+            // canonical ticking instance; the DistanceManager ticket range is
+            // the authoritative simulation-state flag for that position.
+            data.setEntityTickingChunk(chunk, inEntityTickingRange);
         }
 
         // PlayerList.placeNewPlayer can run before chunk topology exists. Keep

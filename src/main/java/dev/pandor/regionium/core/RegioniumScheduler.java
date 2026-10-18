@@ -2,6 +2,7 @@ package dev.pandor.regionium.core;
 
 import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.access.ServerPlayerRegioniumPacketAccess;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.PacketListener;
 import net.minecraft.network.PacketProcessor;
 import net.minecraft.network.protocol.Packet;
@@ -9,6 +10,10 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ChunkResult;
+import net.minecraft.server.level.TicketType;
+import net.minecraft.server.level.Ticket;
+import net.minecraft.server.level.ChunkLevel;
+import net.minecraft.server.level.FullChunkStatus;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.entity.Entity;
@@ -17,6 +22,8 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.ticks.LevelTicks;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -36,6 +43,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * Region scheduler.
@@ -45,6 +53,15 @@ import java.util.function.Consumer;
  * is independently scheduled onto a stable worker; distinct workers run in parallel.
  */
 public final class RegioniumScheduler implements AutoCloseable {
+    // Accessed only on the Minecraft server thread. Refcounts prevent concurrent
+    // portal searches from releasing a chunk ticket still used by another search.
+    private static final TicketType REGIONIUM_ASYNC_TICKET =
+        new TicketType(TicketType.NO_TIMEOUT, TicketType.FLAG_LOADING | TicketType.FLAG_KEEP_DIMENSION_ACTIVE);
+    private static final Map<AsyncChunkTicketKey, Integer> ASYNC_CHUNK_TICKET_REFERENCES = new HashMap<>();
+
+    private record AsyncChunkTicketKey(ServerLevel level, long chunkKey, int ticketLevel) {
+    }
+
     public static final int DEFAULT_REGION_COUNT =
         Math.clamp(Runtime.getRuntime().availableProcessors(), 1, 16);
 
@@ -69,6 +86,12 @@ public final class RegioniumScheduler implements AutoCloseable {
     // and drops the scheduled tick.
     private final ConcurrentMap<ChunkExecutionKey,
         ConcurrentLinkedQueue<DeferredScheduledTick>> deferredScheduledTicks =
+        new ConcurrentHashMap<>();
+
+    // Async chunk loads can finish before the next global chunk-lifecycle pass
+    // publishes their FULL chunks into the region topology. Portal transitions
+    // wait here instead of failing with a missing spatial owner.
+    private final ConcurrentMap<ChunkExecutionKey, ConcurrentLinkedQueue<Runnable>> pendingOwnedTasks =
         new ConcurrentHashMap<>();
 
     /*
@@ -378,6 +401,11 @@ public final class RegioniumScheduler implements AutoCloseable {
 
         levelRegions.put(level, List.of());
         regionizer.registerLevel(level);
+        // A dimension can be registered after ChunkMap has already created
+        // holders (notably when an async portal first touches the Nether/End).
+        // Force one initial topology reconciliation so those existing FULL
+        // holders are not left without a region owner.
+        regionizer.markTopologyDirty(level);
 
         // Folia does not start a permanent tick loop for every possible region.
         // A region becomes schedulable only after the regionizer has acquired
@@ -614,6 +642,66 @@ public final class RegioniumScheduler implements AutoCloseable {
     public void prepareChunkExecution(ServerLevel level) {
         registerLevel(level);
         regionizer.rebalance(level);
+        drainPendingOwnedTasks(level);
+    }
+
+    /**
+     * Runs an operation on the region that spatially owns this position. If an
+     * async chunk request completed before its FULL holder was reconciled into
+     * the region topology, keep the operation queued until the next lifecycle
+     * pass publishes that owner. The caller must retain its chunk tickets until
+     * the operation completes.
+     */
+    public void executeWhenOwned(ServerLevel level, BlockPos pos, Runnable action) {
+        Objects.requireNonNull(level, "level");
+        Objects.requireNonNull(pos, "pos");
+        Objects.requireNonNull(action, "action");
+        long chunkKey = ChunkPos.pack(pos);
+        RegioniumRegion owner = regionizer.owner(level, chunkKey);
+        if (owner != null) {
+            owner.execute(action);
+            return;
+        }
+
+        ChunkExecutionKey key = new ChunkExecutionKey(level, chunkKey);
+        pendingOwnedTasks.computeIfAbsent(key, ignored -> new ConcurrentLinkedQueue<>()).add(action);
+
+        // Close the race where topology became available just before the task
+        // was enqueued. If it is still unavailable, the global lifecycle pass
+        // will drain it after reconciling the FULL chunk holders.
+        owner = regionizer.owner(level, chunkKey);
+        if (owner != null) {
+            drainPendingOwnedTasks(key, owner);
+        } else {
+            level.getServer().execute(() -> prepareChunkExecution(level));
+        }
+    }
+
+    private void drainPendingOwnedTasks(ServerLevel level) {
+        for (Map.Entry<ChunkExecutionKey, ConcurrentLinkedQueue<Runnable>> entry : pendingOwnedTasks.entrySet()) {
+            ChunkExecutionKey key = entry.getKey();
+            if (key.level() != level) {
+                continue;
+            }
+            RegioniumRegion owner = regionizer.owner(level, key.chunk());
+            if (owner != null) {
+                drainPendingOwnedTasks(key, owner);
+            }
+        }
+    }
+
+    private void drainPendingOwnedTasks(ChunkExecutionKey key, RegioniumRegion owner) {
+        ConcurrentLinkedQueue<Runnable> queue = pendingOwnedTasks.get(key);
+        if (queue == null) {
+            return;
+        }
+        Runnable task;
+        while ((task = queue.poll()) != null) {
+            owner.execute(task);
+        }
+        if (queue.isEmpty()) {
+            pendingOwnedTasks.remove(key, queue);
+        }
     }
 
     public void parallelTickChunks(
@@ -847,39 +935,141 @@ public final class RegioniumScheduler implements AutoCloseable {
      * status checks; world-state reads and mutations still belong on the
      * region owning each chunk.
      */
+    /**
+     * Keeps explicit, non-expiring chunk tickets alive for the entire asynchronous
+     * operation. Vanilla getChunkFuture() uses short-lived UNKNOWN tickets which
+     * can expire before an asynchronous future completes; portal searches must
+     * not rely on those tickets.
+     */
+    public <T> CompletableFuture<T> withChunksAsync(
+        ServerLevel level,
+        Collection<ChunkPos> requestedChunks,
+        ChunkStatus status,
+        Function<List<ChunkAccess>, CompletableFuture<T>> operation
+    ) {
+        Objects.requireNonNull(level, "level");
+        Objects.requireNonNull(requestedChunks, "requestedChunks");
+        Objects.requireNonNull(status, "status");
+        Objects.requireNonNull(operation, "operation");
+        List<ChunkPos> chunks = List.copyOf(new LinkedHashSet<>(requestedChunks));
+        if (chunks.isEmpty()) {
+            try {
+                return Objects.requireNonNull(operation.apply(List.of()), "operation future");
+            } catch (Throwable failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+        }
+
+        CompletableFuture<Void> ticketsReady = new CompletableFuture<>();
+        level.getServer().execute(() -> {
+            try {
+                int ticketLevel = ChunkLevel.byStatus(status);
+                for (ChunkPos pos : chunks) {
+                    AsyncChunkTicketKey key = new AsyncChunkTicketKey(level, ChunkPos.pack(pos.x(), pos.z()), ticketLevel);
+                    int references = ASYNC_CHUNK_TICKET_REFERENCES.getOrDefault(key, 0);
+                    if (references == 0) {
+                        level.getChunkSource().addTicket(new Ticket(REGIONIUM_ASYNC_TICKET, ticketLevel), pos);
+                    }
+                    ASYNC_CHUNK_TICKET_REFERENCES.put(key, references + 1);
+                }
+                ticketsReady.complete(null);
+            } catch (Throwable failure) {
+                ticketsReady.completeExceptionally(failure);
+            }
+        });
+
+        CompletableFuture<T> work = ticketsReady.thenComposeAsync(ignored -> {
+            List<CompletableFuture<ChunkResult<ChunkAccess>>> futures = new ArrayList<>(chunks.size());
+            for (ChunkPos pos : chunks) {
+                futures.add(level.getChunkSource().getChunkFuture(pos.x(), pos.z(), status, true));
+            }
+            CompletableFuture<?>[] all = futures.toArray(CompletableFuture[]::new);
+            return CompletableFuture.allOf(all).thenComposeAsync(nothing -> {
+                List<ChunkAccess> loaded = new ArrayList<>(futures.size());
+                for (int i = 0; i < futures.size(); i++) {
+                    ChunkResult<ChunkAccess> result = futures.get(i).join();
+                    ChunkAccess chunk = result.orElse(null);
+                    if (chunk == null) {
+                        throw new IllegalStateException(
+                            "Asynchronous chunk load failed for " + chunks.get(i) + " in "
+                                + level.dimension() + ": " + result.getError()
+                        );
+                    }
+                    loaded.add(chunk);
+                }
+                return Objects.requireNonNull(operation.apply(List.copyOf(loaded)), "operation future");
+            });
+        });
+
+        CompletableFuture<T> released = new CompletableFuture<>();
+        work.whenComplete((value, failure) -> level.getServer().execute(() -> {
+            Throwable completionFailure = failure;
+            try {
+                int ticketLevel = ChunkLevel.byStatus(status);
+                int ticketRadius = ChunkLevel.byStatus(FullChunkStatus.FULL) - ticketLevel;
+                for (ChunkPos pos : chunks) {
+                    AsyncChunkTicketKey key = new AsyncChunkTicketKey(level, ChunkPos.pack(pos.x(), pos.z()), ticketLevel);
+                    Integer references = ASYNC_CHUNK_TICKET_REFERENCES.get(key);
+                    if (references == null) {
+                        continue;
+                    }
+                    if (references > 1) {
+                        ASYNC_CHUNK_TICKET_REFERENCES.put(key, references - 1);
+                    } else {
+                        ASYNC_CHUNK_TICKET_REFERENCES.remove(key);
+                        level.getChunkSource().removeTicketWithRadius(REGIONIUM_ASYNC_TICKET, pos, ticketRadius);
+                    }
+                }
+            } catch (Throwable releaseFailure) {
+                if (completionFailure != null) {
+                    completionFailure.addSuppressed(releaseFailure);
+                } else {
+                    completionFailure = releaseFailure;
+                }
+            }
+            if (completionFailure == null) {
+                released.complete(value);
+            } else {
+                released.completeExceptionally(completionFailure);
+            }
+        }));
+        return released;
+    }
+
+    public <T> CompletableFuture<T> withChunksAsync(
+        ServerLevel level,
+        BlockPos center,
+        int radius,
+        ChunkStatus status,
+        Function<List<ChunkAccess>, CompletableFuture<T>> operation
+    ) {
+        if (radius < 0) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("radius must be non-negative"));
+        }
+        ChunkPos centerChunk = ChunkPos.containing(center);
+        List<ChunkPos> chunks = new ArrayList<>((radius * 2 + 1) * (radius * 2 + 1));
+        for (int x = centerChunk.x() - radius; x <= centerChunk.x() + radius; x++) {
+            for (int z = centerChunk.z() - radius; z <= centerChunk.z() + radius; z++) {
+                chunks.add(new ChunkPos(x, z));
+            }
+        }
+        return withChunksAsync(level, chunks, status, operation);
+    }
+
+    /**
+     * Loads a square of chunks asynchronously. The temporary tickets are released
+     * when this future completes; use withChunksAsync when the caller must inspect
+     * or mutate those chunks after loading, so their tickets remain held throughout.
+     */
     public CompletableFuture<List<ChunkAccess>> prepareChunksAsync(
         ServerLevel level,
-        net.minecraft.core.BlockPos center,
+        BlockPos center,
         int radius,
         ChunkStatus status
     ) {
-        Objects.requireNonNull(level, "level");
-        Objects.requireNonNull(center, "center");
-        Objects.requireNonNull(status, "status");
-        if (radius < 0) {
-            throw new IllegalArgumentException("radius must be non-negative");
-        }
-
-        ChunkPos centerChunk = ChunkPos.containing(center);
-        List<CompletableFuture<ChunkResult<ChunkAccess>>> futures = new ArrayList<>();
-        for (int x = centerChunk.x() - radius; x <= centerChunk.x() + radius; x++) {
-            for (int z = centerChunk.z() - radius; z <= centerChunk.z() + radius; z++) {
-                futures.add(level.getChunkSource().getChunkFuture(x, z, status, true));
-            }
-        }
-
-        CompletableFuture<?>[] all = futures.toArray(CompletableFuture[]::new);
-        return CompletableFuture.allOf(all).thenApply(ignored -> {
-            List<ChunkAccess> chunks = new ArrayList<>(futures.size());
-            for (CompletableFuture<ChunkResult<ChunkAccess>> future : futures) {
-                ChunkAccess chunk = future.join().orElse(null);
-                if (chunk == null) {
-                    throw new IllegalStateException("Asynchronous chunk preparation failed in " + level.dimension());
-                }
-                chunks.add(chunk);
-            }
-            return List.copyOf(chunks);
-        });
+        return withChunksAsync(level, center, radius, status,
+            CompletableFuture::completedFuture
+        );
     }
 
     public void assign(Object object, RegioniumRegion region) {
@@ -1083,6 +1273,13 @@ public final class RegioniumScheduler implements AutoCloseable {
 
     private void tickConnectionsForRegion(RegioniumRegion region) {
         for (ServerPlayer player : List.copyOf(region.worldData().players())) {
+            // A removed player may remain in the previous region's player set
+            // until the entity-manager callback is reconciled. Never tick its
+            // connection while a dimension/region transfer is in flight.
+            if (player.isRemoved() || player.level() != region.level()
+                || RegioniumPortalDispatcher.isTransferPending(player)) {
+                continue;
+            }
             /*
              * A player can cross a region boundary on the server thread
              * (teleport/portal) between two region ticks. The entity remains

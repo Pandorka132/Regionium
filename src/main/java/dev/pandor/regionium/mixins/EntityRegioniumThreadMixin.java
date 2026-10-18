@@ -57,7 +57,13 @@ public abstract class EntityRegioniumThreadMixin {
         // EntitySectionStorage from the region worker and races other regions.
         // Queue the corresponding ChunkMap.move() for the server thread; it
         // must not run concurrently with another region's chunk tracking.
-        if (self instanceof net.minecraft.server.level.ServerPlayer player) {
+        if (self instanceof net.minecraft.server.level.ServerPlayer player
+            && !dev.pandor.regionium.core.RegioniumPortalDispatcher.isTransferPending(player)) {
+            // A portal transfer changes the ServerPlayer's level and position in
+            // separate steps, just like Folia's transformForAsyncTeleport. Do
+            // not publish an intermediate source-coordinate move into the
+            // destination world's global chunk tracker. addDuringTeleport will
+            // track the player after the final position has been installed.
             Regionium.scheduler().queueGlobalPlayerMove(player);
         }
         return;
@@ -77,12 +83,18 @@ public abstract class EntityRegioniumThreadMixin {
     ) {
         Entity self = (Entity) (Object) this;
         if (!RegioniumContext.isRegionThread()
-            || !(self.level() instanceof ServerLevel)) {
+            || !(self.level() instanceof ServerLevel level)) {
             original.call(callback, reason);
             return;
         }
 
-        original.call(callback, reason);
-        dev.pandor.regionium.Regionium.scheduler().untrackEntity(self);
+        // EntityLookup, PersistentEntitySectionManager, and ChunkMap use vanilla
+        // mutable maps which are not safe for concurrent writes from region
+        // workers. Removing an entity directly here races chunk-status changes
+        // on the server thread and can corrupt their fastutil maps. Detach it
+        // from Regionium's owner-local set now, then perform vanilla's callback
+        // on the one thread that owns those global indexes.
+        Regionium.scheduler().untrackEntity(self);
+        level.getServer().execute(() -> original.call(callback, reason));
     }
 }

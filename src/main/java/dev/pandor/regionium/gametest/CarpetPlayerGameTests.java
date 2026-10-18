@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.gametest.v1.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundAcceptTeleportationPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
@@ -15,7 +16,10 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.NetherPortalBlock;
+import net.minecraft.world.level.block.Portal;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.BlockHitResult;
@@ -267,6 +271,110 @@ public final class CarpetPlayerGameTests {
     }
 
 
+    @GameTest(maxTicks = 1600)
+    public void carpetPlayerNetherPortalTransferIsRegionThreaded(GameTestHelper helper) {
+        var level = helper.getLevel();
+        Regionium.scheduler().registerLevel(level);
+        Regionium.scheduler().refreshChunkLeases(level);
+
+        final String playerName = "RegioniumPortalPlayer";
+        final String anchorName = "RegioniumPortalAnchor";
+        final int baseX = 24580;
+        final int anchorX = baseX + FAR_OFFSET;
+        final int z = 4;
+        var playerUuid = new java.util.concurrent.atomic.AtomicReference<java.util.UUID>();
+        var portalPosition = new java.util.concurrent.atomic.AtomicReference<BlockPos>();
+        var setupFailure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var nether = level.getServer().getLevel(Level.NETHER);
+        if (nether == null) {
+            throw helper.assertionException("Nether dimension is unavailable in GameTestServer");
+        }
+
+        helper.startSequence()
+            .thenExecute(() -> {
+                killBot(helper, playerName);
+                killBot(helper, anchorName);
+                runCommand(helper, "carpet allowSpawningOfflinePlayers true");
+                runCommand(helper, "forceload add " + baseX + " " + z);
+                runCommand(helper, "forceload add " + anchorX + " " + z);
+                runCommand(helper, "player " + playerName + " spawn at " + baseX + " 80 " + z);
+                runCommand(helper, "player " + anchorName + " spawn at " + anchorX + " 80 " + z);
+            })
+            .thenWaitUntil(() -> waitForPairOwners(helper, playerName, anchorName))
+            .thenExecute(() -> {
+                preparePlatform(helper, baseX, z);
+                preparePlatform(helper, anchorX, z);
+            })
+            .thenWaitUntil(() -> waitForPlatforms(helper, baseX, z, anchorX, z))
+            .thenExecute(() -> {
+                teleportPlayer(helper, playerName, baseX, z);
+                teleportPlayer(helper, anchorName, anchorX, z);
+            })
+            .thenIdle(20)
+            .thenExecute(() -> {
+                ServerPlayer player = requirePlayer(helper, playerName);
+                BlockPos portalPos = player.blockPosition();
+                playerUuid.set(player.getUUID());
+                Regionium.scheduler().execute(level, portalPos, () -> {
+                    try {
+                        level.setBlockAndUpdate(portalPos, Blocks.NETHER_PORTAL.defaultBlockState()
+                            .setValue(NetherPortalBlock.AXIS, Direction.Axis.X));
+                        player.setPortalCooldown(0);
+                        portalPosition.set(portalPos.immutable());
+                    } catch (Throwable failure) {
+                        setupFailure.set(failure);
+                    }
+                });
+            })
+            // Simulate vanilla's per-tick portal contact instead of calling
+            // handlePortal 120 times in one region task. The real portal
+            // processor advances once per tick and resets its inside flag.
+            .thenExecuteFor(120, () -> {
+                java.util.UUID uuid = playerUuid.get();
+                BlockPos pos = portalPosition.get();
+                if (uuid == null || pos == null) {
+                    return;
+                }
+                Entity current = level.getEntity(uuid);
+                if (!(current instanceof ServerPlayer player) || player.level() != level || player.isRemoved()) {
+                    return;
+                }
+                Regionium.scheduler().executeWhenOwned(level, pos, () -> {
+                    if (!player.isRemoved() && player.level() == level) {
+                        player.setAsInsidePortal((Portal) Blocks.NETHER_PORTAL, pos);
+                        ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) player)
+                            .regionium$invokeHandlePortal();
+                    }
+                });
+            })
+            .thenWaitUntil(() -> {
+                Throwable failure = setupFailure.get();
+                if (failure != null) {
+                    throw helper.assertionException("Could not start player Nether portal transfer: " + failure);
+                }
+                java.util.UUID uuid = playerUuid.get();
+                if (uuid == null) {
+                    throw helper.assertionException("Waiting for player Nether portal setup");
+                }
+                Entity transferred = nether.getEntity(uuid);
+                if (!(transferred instanceof ServerPlayer player) || player.level() != nether) {
+                    throw helper.assertionException("Waiting for asynchronous player Nether portal transfer");
+                }
+                if (player.getX() > 10000.0 || player.getX() < -10000.0) {
+                    throw helper.assertionException("Nether portal transfer kept unscaled Overworld coordinates: " + player.position());
+                }
+                if (Regionium.scheduler().regionizer().regionFor(player) == null) {
+                    throw helper.assertionException("Transferred player did not acquire a Nether region owner");
+                }
+            })
+            .thenExecute(() -> {
+                cleanupPair(helper, playerName, anchorName);
+                runCommand(helper, "forceload remove " + baseX + " " + z);
+                runCommand(helper, "forceload remove " + anchorX + " " + z);
+            })
+            .thenSucceed();
+    }
+
     /**
      * Regression for failures that only appeared after several player transfers.
      * Three A -> B -> A cycles force repeated region merge/split operations while
@@ -282,7 +390,7 @@ public final class CarpetPlayerGameTests {
         final BlockPos lampPos = new BlockPos(destinationX + 8, 80, 0);
         final BlockPos waterPos = new BlockPos(destinationX + 12, 80, 0);
         final BlockPos waterFlowPos = waterPos.east();
-        final BlockPos pistonPos = new BlockPos(destinationX + 2, 80, 0);
+        final BlockPos pistonPos = new BlockPos(destinationX + 2, 80, 2);
         final BlockPos redstoneSupportPos = pistonPos.west();
         final BlockPos redstonePos = redstoneSupportPos;
         final RegioniumRegion[] initialOwners = new RegioniumRegion[2];
@@ -434,7 +542,10 @@ public final class CarpetPlayerGameTests {
                 if (!helper.getLevel().getBlockState(pistonPos).getValue(BlockStateProperties.EXTENDED)) {
                     throw helper.assertionException(
                         "Block-placement packet placed redstone, but neighbour/block-event processing did not extend piston: "
-                            + helper.getLevel().getBlockState(pistonPos));
+                            + helper.getLevel().getBlockState(pistonPos)
+                            + ", neighborSignal=" + helper.getLevel().hasNeighborSignal(pistonPos)
+                            + ", redstone=" + helper.getLevel().getBlockState(redstonePos)
+                            + ", region=" + Regionium.scheduler().regionizer().owner(helper.getLevel(), net.minecraft.world.level.ChunkPos.pack(pistonPos)));
                 }
             })
             .thenExecute(() -> {
