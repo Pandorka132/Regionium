@@ -24,9 +24,6 @@ abstract class CollectingNeighborUpdaterMultiRegioniumMixin {
     private BlockState regionium$readOnlyOwnedLoadedNeighbor(Level level, BlockPos pos) {
 
         BlockState state = RegioniumContext.getBlockStateIfOwnedAndLoaded(level, pos, 25);
-        if (pos.getX() >= 17650 && pos.getX() <= 17680) {
-            Regionium.LOGGER.info("[PACKET-REDSTONE-DIAG] multi read pos={} state={} current={}", pos, state, RegioniumContext.currentRegion());
-        }
         return state;
     }
 

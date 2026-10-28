@@ -60,9 +60,6 @@ public abstract class ServerLevelRegioniumRedstoneMixin {
             return;
         }
 
-        if (pos.getX() >= 17650 && pos.getX() <= 17680) {
-            Regionium.LOGGER.info("[PACKET-REDSTONE-DIAG] updateNeighborsAt pos={} block={} region={}", pos, block, current);
-        }
         current.worldData().neighborUpdater().updateNeighborsAtExceptFromFacing(
             pos,
             block,
@@ -138,10 +135,6 @@ public abstract class ServerLevelRegioniumRedstoneMixin {
             return;
         }
 
-        if (pos.getX() >= 17650 && pos.getX() <= 17680) {
-            Regionium.LOGGER.info("[PACKET-REDSTONE-DIAG] neighborChanged pos={} changedBlock={} state={} region={}",
-                pos, changedBlock, level.getBlockState(pos), current);
-        }
         current.worldData().neighborUpdater().neighborChanged(pos, changedBlock, orientation);
         ci.cancel();
     }
@@ -191,10 +184,6 @@ public abstract class ServerLevelRegioniumRedstoneMixin {
             );
         }
 
-        if (pos.getX() >= 17650 && pos.getX() <= 17680) {
-            Regionium.LOGGER.info("[PACKET-REDSTONE-DIAG] queued blockEvent pos={} block={} params={},{} region={}",
-                pos, block, paramA, paramB, current);
-        }
         current.worldData().pushBlockEvent(new BlockEventData(pos, block, paramA, paramB));
         ci.cancel();
     }
@@ -211,10 +200,6 @@ public abstract class ServerLevelRegioniumRedstoneMixin {
         List<BlockEventData> reschedule = new ArrayList<>(64);
         BlockEventData event;
         while ((event = data.removeFirstBlockEvent()) != null) {
-            if (event.pos().getX() >= 17650 && event.pos().getX() <= 17680) {
-                Regionium.LOGGER.info("[PACKET-REDSTONE-DIAG] processing blockEvent pos={} block={} shouldTick={} region={}",
-                    event.pos(), event.block(), level.shouldTickBlocksAt(event.pos()), current);
-            }
             if (level.shouldTickBlocksAt(event.pos())) {
                 if (regionium$doBlockEvent(event)) {
                     level.getServer().getPlayerList().broadcast(
