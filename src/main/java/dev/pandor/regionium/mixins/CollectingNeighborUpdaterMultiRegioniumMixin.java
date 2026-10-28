@@ -23,19 +23,10 @@ abstract class CollectingNeighborUpdaterMultiRegioniumMixin {
     )
     private BlockState regionium$readOnlyOwnedLoadedNeighbor(Level level, BlockPos pos) {
 
-        if (level instanceof ServerLevel serverLevel) {
-            var current = RegioniumContext.currentRegion();
-            long chunkKey = ChunkPos.pack(pos);
-            if (current != null
-                && (!Regionium.scheduler().isCurrentRegionFor(serverLevel, pos)
-                    || (!current.worldData().hasChunk(chunkKey)
-                        && !Regionium.scheduler().regionizer().hasLoadedFullChunk(serverLevel, chunkKey)))) {
-        
-                return null;
-            }
+        BlockState state = RegioniumContext.getBlockStateIfOwnedAndLoaded(level, pos, 25);
+        if (pos.getX() >= 17650 && pos.getX() <= 17680) {
+            Regionium.LOGGER.info("[PACKET-REDSTONE-DIAG] multi read pos={} state={} current={}", pos, state, RegioniumContext.currentRegion());
         }
-        BlockState state = level.getBlockState(pos);
-
         return state;
     }
 

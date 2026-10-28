@@ -1,6 +1,7 @@
 package dev.pandor.regionium.mixins;
 
 import dev.pandor.regionium.Regionium;
+import dev.pandor.regionium.access.EntityRegioniumPortalAccess;
 import dev.pandor.regionium.core.RegioniumContext;
 import dev.pandor.regionium.core.RegioniumPortalChunkAccess;
 import dev.pandor.regionium.core.RegioniumPortalDispatcher;
@@ -15,10 +16,14 @@ import net.minecraft.network.protocol.game.ClientboundPlayerAbilitiesPacket;
 import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
 import net.minecraft.util.BlockUtil;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EntityTypes;
+import net.minecraft.world.entity.monster.Endermite;
 import net.minecraft.world.entity.projectile.throwableitemprojectile.ThrownEnderpearl;
 import net.minecraft.world.entity.PortalProcessor;
 import net.minecraft.world.entity.PositionMoveRotation;
@@ -59,19 +64,19 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * Folia-style asynchronous portal pipeline for Regionium.
- *
+ * <p>
  * Portal destination discovery and chunk preparation happen asynchronously.
  * Entity state is only detached on its owning region and destination entities
  * are only inserted on the destination region. No global tick pause and no
  * synchronous cross-region chunk loading are used.
  */
 @Mixin(Entity.class)
-public abstract class EntityRegioniumPortalMixin {
+public abstract class EntityRegioniumPortalMixin implements EntityRegioniumPortalAccess {
     @Shadow
-    private PortalProcessor portalProcess;
+    public PortalProcessor portalProcess;
 
     @Shadow
-    private void processPortalCooldown() {
+    protected void processPortalCooldown() {
         throw new AssertionError();
     }
 
@@ -82,11 +87,28 @@ public abstract class EntityRegioniumPortalMixin {
     public abstract void restoreFrom(Entity oldEntity);
 
     @Shadow
-    public abstract void unsetRemoved();
+    protected abstract void unsetRemoved();
 
     @Unique
-    private void regionium$unsetRemoved() {
+    @Override
+    public void regionium$removeAfterChangingDimensions() {
+        this.removeAfterChangingDimensions();
+    }
+
+    @Unique
+    @Override
+    public void regionium$unsetRemoved() {
         this.unsetRemoved();
+    }
+
+    @org.spongepowered.asm.mixin.injection.Redirect(
+        method = "baseTick",
+        at = @At(value = "INVOKE", target = "Lnet/minecraft/world/entity/Entity;handlePortal()V")
+    )
+    private void regionium$deferPortalHandlingUntilAfterEntityTick(Entity entity) {
+        // Folia removes portal handling from Entity.baseTick(). ServerLevel
+        // invokes it after tick()/rideTick(), once portal contact for this tick
+        // has been recorded. Running it here advances PortalProcessor too early.
     }
 
     @Inject(method = "handlePortal", at = @At("HEAD"), cancellable = true)
@@ -124,7 +146,7 @@ public abstract class EntityRegioniumPortalMixin {
         BlockPos entry = processor.getEntryPosition().immutable();
         BlockState state = source.getBlockState(entry);
         if (!(state.getBlock() instanceof Portal portal)
-            || !RegioniumPortalDispatcher.invokePortalAsync(source, entity, portal, entry)) {
+            || !RegioniumPortalDispatcher.startPortalTransferForPortal(portal, source, entity, entry)) {
             RegioniumPortalDispatcher.endTransfer(entity);
         }
     }
@@ -243,6 +265,109 @@ public abstract class EntityRegioniumPortalMixin {
                 Regionium.LOGGER.error("Could not retain the source region during portal transfer for {}", entity, failure);
             }
         });
+        return true;
+    }
+
+    @Unique
+    @Override
+    public boolean regionium$startEnderPearlTransfer(
+        Entity entity,
+        ServerLevel source,
+        Vec3 destinationPosition,
+        boolean spawnEndermite
+    ) {
+        if (!RegioniumPortalDispatcher.beginTransfer(entity)) {
+            return false;
+        }
+
+        try {
+            Regionium.scheduler().executeEntity(entity, () -> {
+                BlockPos sourcePosition = entity.blockPosition();
+                Regionium.scheduler().withChunksAsync(source, sourcePosition, 0, ChunkStatus.FULL, sourceChunks -> {
+            CompletableFuture<Void> operation = new CompletableFuture<>();
+            Regionium.scheduler().executeWhenOwned(source, sourcePosition, () -> {
+                if (entity.level() != source || entity.isRemoved()
+                    || !(entity instanceof ServerPlayer player)
+                    || !player.isAlive() || player.isSleeping()
+                    || !player.connection.isAcceptingMessages()) {
+                    RegioniumPortalDispatcher.endTransfer(entity);
+                    operation.complete(null);
+                    return;
+                }
+
+                try {
+                    if (spawnEndermite) {
+                        Endermite endermite = EntityTypes.ENDERMITE.create(source, EntitySpawnReason.TRIGGERED);
+                        if (endermite != null) {
+                            endermite.snapTo(
+                                player.getX(), player.getY(), player.getZ(),
+                                player.getYRot(), player.getXRot()
+                            );
+                            source.addFreshEntity(endermite);
+                        }
+                    }
+
+                    RegioniumPortalTransfer transfer =
+                        this.regionium$detachForPortalTransfer(entity, source, source);
+                    if (transfer == null) {
+                        RegioniumPortalDispatcher.endTransfer(entity);
+                        operation.complete(null);
+                        return;
+                    }
+
+                    BlockPos target = BlockPos.containing(destinationPosition);
+                    TeleportTransition transition = new TeleportTransition(
+                        source, destinationPosition, Vec3.ZERO, 0.0F, 0.0F,
+                        Relative.ROTATION, TeleportTransition.DO_NOTHING
+                    );
+                    Regionium.scheduler().withChunksAsync(source, target, 0, ChunkStatus.FULL,
+                        targetChunks -> transfer.complete(transition)
+                    ).whenComplete((ignored, failure) -> {
+                        if (failure != null) {
+                            Regionium.LOGGER.error(
+                                "Asynchronous ender-pearl transfer failed for {}", entity, failure
+                            );
+                            transfer.restore("ender-pearl destination preparation or placement failed")
+                                .whenComplete((restored, restoreFailure) -> {
+                                    if (restoreFailure != null) failure.addSuppressed(restoreFailure);
+                                    operation.completeExceptionally(failure);
+                                });
+                            return;
+                        }
+
+                        Regionium.scheduler().executeEntity(entity, () -> {
+                            if (entity instanceof ServerPlayer teleported && !teleported.isRemoved()) {
+                                teleported.resetFallDistance();
+                                teleported.resetCurrentImpulseContext();
+                                teleported.hurtServer(
+                                    source, teleported.damageSources().enderPearl(), 5.0F
+                                );
+                                source.playSound(
+                                    null, destinationPosition.x, destinationPosition.y, destinationPosition.z,
+                                    SoundEvents.PLAYER_TELEPORT, SoundSource.PLAYERS
+                                );
+                            }
+                            operation.complete(null);
+                        });
+                    });
+                } catch (Throwable failure) {
+                    RegioniumPortalDispatcher.endTransfer(entity);
+                    operation.completeExceptionally(failure);
+                }
+            });
+            return operation;
+                }).whenComplete((ignored, failure) -> {
+                    if (failure != null) {
+                        RegioniumPortalDispatcher.endTransfer(entity);
+                        Regionium.LOGGER.error("Could not retain chunks for ender-pearl transfer of {}", entity, failure);
+                    }
+                });
+            });
+        } catch (Throwable failure) {
+            RegioniumPortalDispatcher.endTransfer(entity);
+            Regionium.LOGGER.error("Could not schedule ender-pearl transfer for {}", entity, failure);
+            return false;
+        }
         return true;
     }
 
@@ -528,7 +653,7 @@ public abstract class EntityRegioniumPortalMixin {
                 Regionium.scheduler().executeWhenOwned(source, existingExit, () -> {
                     try {
                         BlockPos target = exactTeleport ? existingExit
-                            : TheEndGatewayBlockEntityRegioniumInvokerMixin.regionium$findExitPosition(source, existingExit);
+                            : TheEndGatewayBlockEntityRegioniumAccessorMixin.regionium$findExitPosition(source, existingExit);
                         result.complete(regionium$gatewayTransition(entity, source, target));
                     } catch (Throwable failure) {
                         result.completeExceptionally(failure);
@@ -547,10 +672,10 @@ public abstract class EntityRegioniumPortalMixin {
                     CompletableFuture<TeleportTransition> result = new CompletableFuture<>();
                     Regionium.scheduler().executeWhenOwned(source, exitPosition, () -> {
                         try {
-                            TheEndGatewayBlockEntityRegioniumInvokerMixin.regionium$spawnGatewayPortal(
+                            TheEndGatewayBlockEntityRegioniumAccessorMixin.regionium$spawnGatewayPortal(
                                 source, exitPosition, EndGatewayFeature.knownExit(entry, false)
                             );
-                            BlockPos finalPosition = TheEndGatewayBlockEntityRegioniumInvokerMixin
+                            BlockPos finalPosition = TheEndGatewayBlockEntityRegioniumAccessorMixin
                                 .regionium$findExitPosition(source, exitPosition);
                             Regionium.scheduler().executeWhenOwned(source, entry, () -> {
                                 try {
@@ -581,7 +706,7 @@ public abstract class EntityRegioniumPortalMixin {
                     Regionium.scheduler().executeWhenOwned(level, candidatePos, () -> {
                         try {
                             LevelChunk chunk = (LevelChunk) loaded.get(0);
-                            BlockPos validSpawn = TheEndGatewayBlockEntityRegioniumInvokerMixin
+                            BlockPos validSpawn = TheEndGatewayBlockEntityRegioniumAccessorMixin
                                 .regionium$findValidSpawnInChunk(chunk);
                             if (validSpawn != null) {
                                 candidateResult.complete(validSpawn);
@@ -621,7 +746,7 @@ public abstract class EntityRegioniumPortalMixin {
                     CompletableFuture<BlockPos> tallest = new CompletableFuture<>();
                     Regionium.scheduler().executeWhenOwned(level, basePosition, () -> {
                         try {
-                            tallest.complete(TheEndGatewayBlockEntityRegioniumInvokerMixin
+                            tallest.complete(TheEndGatewayBlockEntityRegioniumAccessorMixin
                                 .regionium$findTallestBlock(level, basePosition, 16, true).above(10));
                         } catch (Throwable failure) {
                             tallest.completeExceptionally(failure);
@@ -729,7 +854,7 @@ public abstract class EntityRegioniumPortalMixin {
                 }
                 source.removePlayerImmediately(player, Entity.RemovalReason.CHANGED_DIMENSION);
             } else {
-                ((EntityRegioniumPortalMixin) (Object) original).removeAfterChangingDimensions();
+                ((EntityRegioniumPortalAccess) (Object) original).regionium$removeAfterChangingDimensions();
             }
         }
 
@@ -869,7 +994,7 @@ public abstract class EntityRegioniumPortalMixin {
                 for (Entity original : originals) {
                     Entity replacement = replacements.get(original);
                     if (replacement instanceof ServerPlayer player) {
-                        ((EntityRegioniumPortalMixin) (Object) player).regionium$unsetRemoved();
+                        ((EntityRegioniumPortalAccess) (Object) player).regionium$unsetRemoved();
                         if (transition.missingRespawnBlock()) {
                             player.connection.send(new ClientboundGameEventPacket(
                                 ClientboundGameEventPacket.NO_RESPAWN_BLOCK_AVAILABLE, 0.0F
@@ -886,6 +1011,13 @@ public abstract class EntityRegioniumPortalMixin {
                         );
                         player.connection.teleport(playerMove, Collections.emptySet());
                         player.connection.resetPosition();
+                        if (source != destination) {
+                            Regionium.LOGGER.info(
+                                "[PortalTrace] placed player={} source={} destination={} position={} cooldown={}",
+                                player.getUUID(), source.dimension(), destination.dimension(),
+                                player.position(), player.getPortalCooldown()
+                            );
+                        }
                         playersTeleported.add(player);
                     }
                     destination.addDuringTeleport(replacement);
@@ -912,7 +1044,7 @@ public abstract class EntityRegioniumPortalMixin {
                             ((ServerPlayerRegioniumPortalAccessorMixin) (Object) player).regionium$setLastSentExperience(-1);
                             ((ServerPlayerRegioniumPortalAccessorMixin) (Object) player).regionium$setLastSentHealth(-1.0F);
                             ((ServerPlayerRegioniumPortalAccessorMixin) (Object) player).regionium$setLastSentFood(-1);
-                            ((ServerPlayerRegioniumPortalInvokerMixin) (Object) player)
+                            ((ServerPlayerRegioniumPortalAccessorMixin) (Object) player)
                                 .regionium$triggerDimensionChangeTriggers(source);
                         }
                     }
@@ -937,7 +1069,7 @@ public abstract class EntityRegioniumPortalMixin {
                         if (replacement instanceof ServerPlayer player) {
                             destination.removePlayerImmediately(player, Entity.RemovalReason.CHANGED_DIMENSION);
                         } else {
-                            ((EntityRegioniumPortalMixin) (Object) replacement).removeAfterChangingDimensions();
+                            ((EntityRegioniumPortalAccess) (Object) replacement).regionium$removeAfterChangingDimensions();
                         }
                     }
                 }
@@ -996,7 +1128,7 @@ public abstract class EntityRegioniumPortalMixin {
                                     player.connection.resetPosition();
                                 }
                             }
-                            ((EntityRegioniumPortalMixin) (Object) original).regionium$unsetRemoved();
+                            ((EntityRegioniumPortalAccess) (Object) original).regionium$unsetRemoved();
                             source.addDuringTeleport(original);
                         }
                         for (Map.Entry<Entity, Entity> entry : parentByPassenger.entrySet()) {

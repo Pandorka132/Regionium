@@ -8,6 +8,7 @@ import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -21,8 +22,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(ServerChunkCache.class)
 public abstract class ServerChunkCacheRegioniumThreadMixin {
-    @Shadow private ServerLevel level;
-    @Shadow public ChunkMap chunkMap;
+    @Shadow @Final private ServerLevel level;
+    @Shadow @Final public ChunkMap chunkMap;
 
     @Inject(
         method = "getChunk",

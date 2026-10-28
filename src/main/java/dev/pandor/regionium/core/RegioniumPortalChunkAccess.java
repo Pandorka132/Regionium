@@ -1,6 +1,6 @@
 package dev.pandor.regionium.core;
 
-import dev.pandor.regionium.mixins.ChunkMapRegioniumInvokerMixin;
+import dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Vec3i;
 import net.minecraft.server.level.ChunkHolder;
@@ -36,7 +36,7 @@ public final class RegioniumPortalChunkAccess {
             return null;
         }
         ChunkMap chunkMap = serverLevel.getChunkSource().chunkMap;
-        ChunkHolder holder = ((ChunkMapRegioniumInvokerMixin) (Object) chunkMap)
+        ChunkHolder holder = ((ChunkMapRegioniumVisibleAccessorMixin) (Object) chunkMap)
             .regionium$getVisibleChunkIfPresent(ChunkPos.pack(chunkX, chunkZ));
         return holder == null ? null : holder.getChunkIfPresent(minimumStatus);
     }

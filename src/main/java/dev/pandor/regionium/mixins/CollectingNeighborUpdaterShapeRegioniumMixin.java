@@ -24,16 +24,8 @@ abstract class CollectingNeighborUpdaterShapeRegioniumMixin {
         LevelAccessor level, Direction direction, BlockPos pos, BlockPos neighborPos, BlockState neighborState,
         int updateFlags, int updateLimit
     ) {
-        if (level instanceof ServerLevel serverLevel) {
-            var current = RegioniumContext.currentRegion();
-            long chunkKey = ChunkPos.pack(pos);
-            if (current != null
-                && (!Regionium.scheduler().isCurrentRegionFor(serverLevel, pos)
-                    || (!current.worldData().hasChunk(chunkKey)
-                        && !Regionium.scheduler().regionizer().hasLoadedFullChunk(serverLevel, chunkKey)))) {
-        
-                return;
-            }
+        if (RegioniumContext.getBlockStateIfOwnedAndLoaded(level, pos, 25) == null) {
+            return;
         }
         NeighborUpdater.executeShapeUpdate(level, direction, pos, neighborPos, neighborState, updateFlags, updateLimit);
     }

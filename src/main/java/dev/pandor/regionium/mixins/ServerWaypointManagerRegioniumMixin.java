@@ -15,21 +15,21 @@ import org.spongepowered.asm.mixin.Mixin;
  */
 @Mixin(ServerWaypointManager.class)
 public abstract class ServerWaypointManagerRegioniumMixin {
-    @WrapMethod(method = "trackWaypoint")
+    @WrapMethod(method = "trackWaypoint(Lnet/minecraft/world/waypoints/WaypointTransmitter;)V")
     private void regionium$trackWaypoint(WaypointTransmitter waypoint, Operation<Void> original) {
         synchronized (this) {
             original.call(waypoint);
         }
     }
 
-    @WrapMethod(method = "updateWaypoint")
+    @WrapMethod(method = "updateWaypoint(Lnet/minecraft/world/waypoints/WaypointTransmitter;)V")
     private void regionium$updateWaypoint(WaypointTransmitter waypoint, Operation<Void> original) {
         synchronized (this) {
             original.call(waypoint);
         }
     }
 
-    @WrapMethod(method = "untrackWaypoint")
+    @WrapMethod(method = "untrackWaypoint(Lnet/minecraft/world/waypoints/WaypointTransmitter;)V")
     private void regionium$untrackWaypoint(WaypointTransmitter waypoint, Operation<Void> original) {
         synchronized (this) {
             original.call(waypoint);

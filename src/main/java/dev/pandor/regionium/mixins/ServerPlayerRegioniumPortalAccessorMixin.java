@@ -4,6 +4,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
+import org.spongepowered.asm.mixin.gen.Invoker;
 
 @Mixin(ServerPlayer.class)
 public interface ServerPlayerRegioniumPortalAccessorMixin {
@@ -21,5 +22,8 @@ public interface ServerPlayerRegioniumPortalAccessorMixin {
 
     @Accessor("lastSentFood")
     void regionium$setLastSentFood(int food);
+
+    @Invoker("triggerDimensionChangeTriggers")
+    void regionium$triggerDimensionChangeTriggers(net.minecraft.server.level.ServerLevel oldLevel);
 
 }

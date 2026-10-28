@@ -7,6 +7,8 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.NetherPortalBlock;
 import net.minecraft.world.level.block.Portal;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.EntitySpawnReason;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.level.Level;
@@ -60,8 +62,6 @@ public final class GameTests {
                         }
                         end.addFreshEntity(pig);
                         pig.setAsInsidePortal((Portal) Blocks.END_GATEWAY, gatewayPos);
-                        ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
-                            .regionium$invokeHandlePortal();
                         setup.complete(null);
                     } catch (Throwable failure) {
                         setup.completeExceptionally(failure);
@@ -72,6 +72,7 @@ public final class GameTests {
         );
 
         helper.startSequence()
+            .thenExecuteFor(120, () -> regionium$touchPortal(end, pig, (Portal) Blocks.END_GATEWAY, gatewayPos))
             .thenWaitUntil(() -> {
                 Entity transferred = end.getEntity(entityUuid);
                 if (transferred == null || transferred == pig || transferred.isRemoved()) {
@@ -105,11 +106,10 @@ public final class GameTests {
 
         dev.pandor.regionium.Regionium.scheduler().execute(source, portalPos, () -> {
             pig.setAsInsidePortal((Portal) Blocks.END_PORTAL, portalPos);
-            ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
-                .regionium$invokeHandlePortal();
         });
 
         helper.startSequence()
+            .thenExecuteFor(120, () -> regionium$touchPortal(source, pig, (Portal) Blocks.END_PORTAL, portalPos))
             .thenWaitUntil(() -> {
                 Entity transferred = end.getEntity(entityUuid);
                 if (transferred == null || transferred.isRemoved()) {
@@ -152,8 +152,6 @@ public final class GameTests {
                         end.addFreshEntity(pig);
                         entityUuid.set(pig.getUUID());
                         pig.setAsInsidePortal((Portal) Blocks.END_PORTAL, portalPos);
-                        ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
-                            .regionium$invokeHandlePortal();
                         setup.complete(null);
                     } catch (Throwable failure) {
                         setupFailure.set(failure);
@@ -169,6 +167,10 @@ public final class GameTests {
         });
 
         helper.startSequence()
+            .thenExecuteFor(120, () -> {
+                Entity current = entityUuid.get() == null ? null : end.getEntity(entityUuid.get());
+                if (current != null) regionium$touchPortal(end, current, (Portal) Blocks.END_PORTAL, portalPos);
+            })
             .thenWaitUntil(() -> {
                 Throwable failure = setupFailure.get();
                 if (failure != null) {
@@ -254,8 +256,6 @@ public final class GameTests {
                     source.addFreshEntity(pig);
                     entityUuid.set(pig.getUUID());
                     pig.setAsInsidePortal((Portal) Blocks.NETHER_PORTAL, sourcePortal);
-                    ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
-                        .regionium$invokeHandlePortal();
                 } catch (Throwable failureToStart) {
                     setupFailure.set(failureToStart);
                 }
@@ -263,6 +263,11 @@ public final class GameTests {
         });
 
         helper.startSequence()
+            .thenExecuteFor(120, () -> {
+                java.util.UUID uuid = entityUuid.get();
+                Entity current = uuid == null ? null : source.getEntity(uuid);
+                if (current != null) regionium$touchPortal(source, current, (Portal) Blocks.NETHER_PORTAL, sourcePortal);
+            })
             .thenWaitUntil(() -> {
                 Throwable failure = setupFailure.get();
                 if (failure != null) {
@@ -316,11 +321,10 @@ public final class GameTests {
 
         dev.pandor.regionium.Regionium.scheduler().execute(source, portalPos, () -> {
             boat.setAsInsidePortal((Portal) Blocks.NETHER_PORTAL, portalPos);
-            ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) boat)
-                .regionium$invokeHandlePortal();
         });
 
         helper.startSequence()
+            .thenExecuteFor(120, () -> regionium$touchPortal(source, boat, (Portal) Blocks.NETHER_PORTAL, portalPos))
             .thenWaitUntil(() -> {
                 Entity transferredBoat = nether.getEntity(boatUuid);
                 Entity transferredPig = nether.getEntity(pigUuid);
@@ -356,11 +360,10 @@ public final class GameTests {
 
         dev.pandor.regionium.Regionium.scheduler().execute(source, portalPos, () -> {
             pig.setAsInsidePortal((Portal) Blocks.NETHER_PORTAL, portalPos);
-            ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) pig)
-                .regionium$invokeHandlePortal();
         });
 
         helper.startSequence()
+            .thenExecuteFor(120, () -> regionium$touchPortal(source, pig, (Portal) Blocks.NETHER_PORTAL, portalPos))
             .thenWaitUntil(() -> {
                 Entity transferred = nether.getEntity(entityUuid);
                 if (transferred == null || transferred.isRemoved()) {
@@ -385,8 +388,21 @@ public final class GameTests {
             helper.setBlock(power, Blocks.REDSTONE_BLOCK);
         });
 
-        helper.succeedWhen(() -> helper.assertBlockProperty(
-            piston, BlockStateProperties.EXTENDED, true));
+        BlockPos absolutePiston = helper.absolutePos(piston);
+        helper.succeedWhen(() -> {
+            // Do not let a failed region tick block the GameTest server thread
+            // in getChunk(); poll the already-loaded chunk non-blockingly.
+            var chunk = helper.getLevel().getChunkSource().getChunkNow(
+                absolutePiston.getX() >> 4, absolutePiston.getZ() >> 4);
+            if (chunk == null) {
+                throw helper.assertionException("Piston chunk is not currently loaded");
+            }
+            var state = chunk.getBlockState(absolutePiston);
+            if (!state.hasProperty(BlockStateProperties.EXTENDED)
+                || !state.getValue(BlockStateProperties.EXTENDED)) {
+                throw helper.assertionException("Piston did not extend: " + state);
+            }
+        });
     }
 
     @GameTest(maxTicks = 500)
@@ -419,10 +435,11 @@ public final class GameTests {
                     throw helper.assertionException(
                         "Falling sand never produced a downward-moving FallingBlockEntity");
                 }
-                if (!helper.getBlockState(landing).is(Blocks.SAND)) {
+                var landingState = regionium$loadedBlockState(helper, landing);
+                if (landingState == null || !landingState.is(Blocks.SAND)) {
                     throw helper.assertionException(
                         "Falling sand did not convert back into a sand block at "
-                            + helper.absolutePos(landing) + ", state=" + helper.getBlockState(landing));
+                            + helper.absolutePos(landing) + ", state=" + landingState);
                 }
             })
             .thenSucceed();
@@ -440,8 +457,13 @@ public final class GameTests {
             helper.getLevel().scheduleTick(helper.absolutePos(lamp), Blocks.REDSTONE_LAMP, 1);
         });
 
-        helper.succeedWhen(() -> helper.assertBlockProperty(
-            lamp, BlockStateProperties.LIT, false));
+        helper.succeedWhen(() -> {
+            var state = regionium$loadedBlockState(helper, lamp);
+            if (state == null || !state.hasProperty(BlockStateProperties.LIT)
+                || state.getValue(BlockStateProperties.LIT)) {
+                throw helper.assertionException("Scheduled lamp tick has not extinguished the lamp: " + state);
+            }
+        });
     }
 
     /**
@@ -481,19 +503,77 @@ public final class GameTests {
                     throw helper.assertionException(
                         "Single-region sticky-piston clock failed to oscillate for 200 ticks: "
                             + "transitions=" + transitions[0]
-                            + ", piston=" + helper.getBlockState(piston)
-                            + ", slime=" + helper.getBlockState(slime)
-                            + ", redstone=" + helper.getBlockState(redstone));
+                            + ", piston=" + regionium$loadedBlockState(helper, piston)
+                            + ", slime=" + regionium$loadedBlockState(helper, slime)
+                            + ", redstone=" + regionium$loadedBlockState(helper, redstone));
                 }
             })
             .thenSucceed();
+    }
+
+    private static net.minecraft.world.level.block.state.BlockState regionium$loadedBlockState(
+        GameTestHelper helper, BlockPos relativePos
+    ) {
+        BlockPos pos = helper.absolutePos(relativePos);
+        var chunk = helper.getLevel().getChunkSource().getChunkNow(pos.getX() >> 4, pos.getZ() >> 4);
+        return chunk == null ? null : chunk.getBlockState(pos);
+    }
+
+    private static boolean regionium$willReceiveNormalTick(ServerLevel level, Entity entity) {
+        var current = dev.pandor.regionium.core.RegioniumContext.currentRegion();
+        if (current == null || current.level() != level
+            || Regionium.scheduler().regionizer().owner(level, entity.chunkPosition().pack()) != current) {
+            return false;
+        }
+        if (entity instanceof ServerPlayer player) {
+            return current.worldData().players().contains(player) && player.connection != null;
+        }
+        long chunkKey = entity.chunkPosition().pack();
+        var chunkMap = (dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
+            (Object) level.getChunkSource().chunkMap;
+        var holder = chunkMap.regionium$getVisibleChunkMap().get(chunkKey);
+        return level.getChunkSource().chunkMap.getDistanceManager().inEntityTickingRange(chunkKey)
+            && holder != null
+            && holder.getEntityTickingChunkFuture()
+                .getNow(net.minecraft.server.level.ChunkHolder.UNLOADED_LEVEL_CHUNK)
+                .orElse(null) != null;
+    }
+
+    private static void regionium$touchPortal(ServerLevel level, Entity entity, Portal portal, BlockPos pos) {
+        Regionium.scheduler().executeWhenOwned(level, pos, () -> {
+            if (entity.level() != level || entity.isRemoved()
+                || level.getEntity(entity.getUUID()) != entity
+                || dev.pandor.regionium.core.RegioniumPortalDispatcher.isTransferPending(entity)) {
+                return;
+            }
+            // Do not invoke portal handling until the source chunk is actually
+            // FULL and the test portal exists. The region owns the section
+            // before chunk promotion completes, but getBlockState must not
+            // synchronously load that chunk from a region worker.
+            var chunk = dev.pandor.regionium.core.RegioniumPortalChunkAccess.getLoadedChunk(
+                level, pos.getX() >> 4, pos.getZ() >> 4,
+                net.minecraft.world.level.chunk.status.ChunkStatus.FULL);
+            if (chunk == null || !(chunk.getBlockState(pos).getBlock() instanceof Portal actualPortal)) {
+                return;
+            }
+            // Simulate portal contact before the entity's normal region tick.
+            // GameTest-created entities that are not eligible for normal ticking
+            // are driven directly, but only after their source chunk is loaded.
+            entity.setAsInsidePortal(actualPortal, pos);
+            if (!regionium$willReceiveNormalTick(level, entity)) {
+                ((dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin) (Object) entity)
+                    .regionium$invokeHandlePortal();
+            }
+        });
     }
 
     private static int stickyPistonClockState(
         net.minecraft.server.level.ServerLevel level,
         BlockPos piston
     ) {
-        var state = level.getBlockState(piston);
+        var chunk = level.getChunkSource().getChunkNow(piston.getX() >> 4, piston.getZ() >> 4);
+        if (chunk == null) return -1;
+        var state = chunk.getBlockState(piston);
         if (state.is(Blocks.MOVING_PISTON)) return 2;
         if (state.is(Blocks.STICKY_PISTON)) {
             return state.getValue(BlockStateProperties.EXTENDED) ? 1 : 0;
@@ -508,17 +588,33 @@ public final class GameTests {
     @GameTest(maxTicks = 20)
     public void external_sanity_block(GameTestHelper helper) {
         BlockPos pos = new BlockPos(1, 1, 1);
-        helper.setBlock(pos, Blocks.DIAMOND_BLOCK);
-        helper.assertBlockPresent(Blocks.DIAMOND_BLOCK, pos);
-        helper.succeed();
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+        Regionium.scheduler().execute(helper.getLevel(), helper.absolutePos(pos),
+            () -> helper.setBlock(pos, Blocks.DIAMOND_BLOCK));
+        helper.succeedWhen(() -> {
+            var state = regionium$loadedBlockState(helper, pos);
+            if (state == null || !state.is(Blocks.DIAMOND_BLOCK)) {
+                throw helper.assertionException("Diamond block not present; loaded state=" + state);
+            }
+        });
     }
 
     @GameTest(maxTicks = 40)
     public void external_sanity_entity(GameTestHelper helper) {
         BlockPos spawn = new BlockPos(2, 2, 2);
         var cow = BuiltInRegistries.ENTITY_TYPE.getValue(Identifier.fromNamespaceAndPath("minecraft", "cow"));
-        helper.spawn(cow, spawn);
-        helper.succeedWhen(() -> helper.assertEntityPresent(cow));
+        java.util.concurrent.atomic.AtomicReference<Entity> spawned = new java.util.concurrent.atomic.AtomicReference<>();
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+        Regionium.scheduler().execute(helper.getLevel(), helper.absolutePos(spawn),
+            () -> spawned.set(helper.spawn(cow, spawn)));
+        helper.succeedWhen(() -> {
+            Entity entity = spawned.get();
+            if (entity == null || entity.isRemoved() || entity.level() != helper.getLevel()) {
+                throw helper.assertionException("Cow was not registered in the owning region");
+            }
+        });
     }
 
     @GameTest(maxTicks = 80)
@@ -536,17 +632,29 @@ public final class GameTests {
 
         helper.startSequence()
             .thenIdle(10)
-            .thenExecute(() -> helper.assertBlockProperty(
-                piston, BlockStateProperties.EXTENDED, true))
+            .thenWaitUntil(() -> {
+                var state = regionium$loadedBlockState(helper, piston);
+                if (state == null || !state.hasProperty(BlockStateProperties.EXTENDED)
+                    || !state.getValue(BlockStateProperties.EXTENDED)) {
+                    throw helper.assertionException("Piston did not extend after packet-free redstone setup: " + state);
+                }
+            })
             .thenExecute(() -> Regionium.scheduler().execute(
                 helper.getLevel(),
                 helper.absolutePos(power),
                 () -> helper.setBlock(power, Blocks.AIR)))
             .thenIdle(10)
-            .thenExecute(() -> {
-                helper.assertBlockProperty(piston, BlockStateProperties.EXTENDED, false);
-                if (helper.getLevel().getBlockEntity(helper.absolutePos(piston)) != null
-                    || helper.getLevel().getBlockEntity(helper.absolutePos(head)) != null) {
+            .thenWaitUntil(() -> {
+                var state = regionium$loadedBlockState(helper, piston);
+                if (state == null || !state.hasProperty(BlockStateProperties.EXTENDED)
+                    || state.getValue(BlockStateProperties.EXTENDED)) {
+                    throw helper.assertionException("Piston did not retract after power removal: " + state);
+                }
+                var absolutePiston = helper.absolutePos(piston);
+                var chunk = helper.getLevel().getChunkSource().getChunkNow(
+                    absolutePiston.getX() >> 4, absolutePiston.getZ() >> 4);
+                if (chunk == null || chunk.getBlockEntity(absolutePiston) != null
+                    || chunk.getBlockEntity(helper.absolutePos(head)) != null) {
                     throw helper.assertionException(
                         "Piston left a stale block entity after completing its extend/retract cycle");
                 }
@@ -557,11 +665,20 @@ public final class GameTests {
     @GameTest(maxTicks = 1000)
     public void external_sanity_scheduled_lamp(GameTestHelper helper) {
         BlockPos lamp = new BlockPos(2, 2, 2);
-        helper.setBlock(lamp, Blocks.REDSTONE_LAMP.defaultBlockState()
-            .setValue(BlockStateProperties.LIT, true));
-        helper.getLevel().scheduleTick(helper.absolutePos(lamp), Blocks.REDSTONE_LAMP, 1);
-        helper.succeedWhen(() -> helper.assertBlockProperty(
-            lamp, BlockStateProperties.LIT, false));
+        Regionium.scheduler().registerLevel(helper.getLevel());
+        Regionium.scheduler().refreshChunkLeases(helper.getLevel());
+        Regionium.scheduler().execute(helper.getLevel(), helper.absolutePos(lamp), () -> {
+            helper.setBlock(lamp, Blocks.REDSTONE_LAMP.defaultBlockState()
+                .setValue(BlockStateProperties.LIT, true));
+            helper.getLevel().scheduleTick(helper.absolutePos(lamp), Blocks.REDSTONE_LAMP, 1);
+        });
+        helper.succeedWhen(() -> {
+            var state = regionium$loadedBlockState(helper, lamp);
+            if (state == null || !state.hasProperty(BlockStateProperties.LIT)
+                || state.getValue(BlockStateProperties.LIT)) {
+                throw helper.assertionException("Scheduled lamp tick has not extinguished the lamp: " + state);
+            }
+        });
     }
 
     @GameTest(maxTicks = 500)
@@ -594,10 +711,11 @@ public final class GameTests {
                     throw helper.assertionException(
                         "Falling sand never produced a downward-moving FallingBlockEntity");
                 }
-                if (!helper.getBlockState(landing).is(Blocks.SAND)) {
+                var landingState = regionium$loadedBlockState(helper, landing);
+                if (landingState == null || !landingState.is(Blocks.SAND)) {
                     throw helper.assertionException(
                         "Falling sand did not convert back into a sand block at "
-                            + helper.absolutePos(landing) + ", state=" + helper.getBlockState(landing));
+                            + helper.absolutePos(landing) + ", state=" + landingState);
                 }
             })
             .thenSucceed();

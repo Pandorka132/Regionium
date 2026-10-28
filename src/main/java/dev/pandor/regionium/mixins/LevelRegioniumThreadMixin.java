@@ -23,7 +23,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Level.class)
 public abstract class LevelRegioniumThreadMixin {
     @Shadow @Final private Thread thread;
-    @Shadow @Final @Mutable private RandomSource random;
+    @Shadow @Final @Mutable protected RandomSource random;
 
     @Inject(method = "<init>", at = @At("TAIL"))
     private void regionium$makeRandomThreadSafe(CallbackInfo ci) {
@@ -89,16 +89,7 @@ public abstract class LevelRegioniumThreadMixin {
             return;
         }
 
-        if (!owner.isRetired() && owner.execute(() -> {
-            if (!ticker.isRemoved()
-                && Regionium.scheduler().regionizer().owner(
-                    level,
-                    net.minecraft.world.level.ChunkPos.containing(ticker.getPos()).pack()
-                ) == owner) {
-                owner.worldData().addBlockEntityTicker(ticker);
-            }
-        })) {
-            ci.cancel();
-        }
+        Regionium.scheduler().registerBlockEntityTickerWhenOwned(level, ticker);
+        ci.cancel();
     }
 }

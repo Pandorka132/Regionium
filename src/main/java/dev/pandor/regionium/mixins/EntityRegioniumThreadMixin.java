@@ -4,6 +4,7 @@ import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.core.RegioniumContext;
+import dev.pandor.regionium.core.RegioniumTickOffsetAccess;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Entity.RemovalReason;
@@ -12,7 +13,7 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 
 @Mixin(Entity.class)
-public abstract class EntityRegioniumThreadMixin {
+public abstract class EntityRegioniumThreadMixin implements RegioniumTickOffsetAccess {
     @WrapOperation(
         method = "setPosRaw",
         at = @At(

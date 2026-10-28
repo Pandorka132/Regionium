@@ -27,9 +27,4 @@ public abstract class ServerLevelRegioniumChunkLifecycleMixin {
         chunk.unpackTicks(time);
     }
 
-    @Inject(method = "unload", at = @At("TAIL"))
-    private void regionium$holderRemoved(LevelChunk chunk, CallbackInfo ci) {
-        ServerLevel level = (ServerLevel) (Object) this;
-        Regionium.scheduler().regionizer().removeChunkHolder(level, chunk.getPos().pack());
-    }
 }

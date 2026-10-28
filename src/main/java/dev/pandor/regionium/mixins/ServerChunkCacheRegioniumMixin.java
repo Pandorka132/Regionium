@@ -1,6 +1,7 @@
 package dev.pandor.regionium.mixins;
 
 import dev.pandor.regionium.Regionium;
+import dev.pandor.regionium.access.ServerChunkCacheRegioniumAccess;
 import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ChunkHolder;
@@ -9,18 +10,24 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.ChunkPos;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.gen.Invoker;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.util.List;
 
 @Mixin(ServerChunkCache.class)
-public abstract class ServerChunkCacheRegioniumMixin {
-    @Shadow private ServerLevel level;
-    @Shadow private ChunkMap chunkMap;
+public abstract class ServerChunkCacheRegioniumMixin implements ServerChunkCacheRegioniumAccess {
+    @Shadow @Final private ServerLevel level;
+    @Shadow @Final public ChunkMap chunkMap;
+
+    @Override
+    @Invoker("runDistanceManagerUpdates")
+    public abstract boolean regionium$runDistanceManagerUpdates();
 
     /**
      * ServerLevel.tick() is the region tick body now. Its ChunkSource must
@@ -54,9 +61,11 @@ public abstract class ServerChunkCacheRegioniumMixin {
             // the global tick's tickChunks pass is suppressed. Route the
             // notification to the chunk owner's region instead of stranding it
             // in that queue. This also covers cross-region callers.
-            if (!owner.execute(() -> regionium$recordBlockChange(immutablePos, chunkKey, owner))) {
-                return;
-            }
+            Regionium.scheduler().executeWhenOwned(
+                level,
+                immutablePos,
+                () -> regionium$recordBlockChange(immutablePos, chunkKey, owner)
+            );
             ci.cancel();
             return;
         }
@@ -67,6 +76,7 @@ public abstract class ServerChunkCacheRegioniumMixin {
         ci.cancel();
     }
 
+@org.spongepowered.asm.mixin.Unique
     private void regionium$recordBlockChange(
         net.minecraft.core.BlockPos pos,
         long chunkKey,
@@ -80,7 +90,11 @@ public abstract class ServerChunkCacheRegioniumMixin {
             // Topology may have changed while this notification was queued.
             // Re-dispatch instead of mutating the new owner's state from the
             // previous owner's thread.
-            owner.execute(() -> regionium$recordBlockChange(pos, chunkKey, owner));
+            Regionium.scheduler().executeWhenOwned(
+                level,
+                pos,
+                () -> regionium$recordBlockChange(pos, chunkKey, owner)
+            );
             return;
         }
 
@@ -115,9 +129,11 @@ public abstract class ServerChunkCacheRegioniumMixin {
             ? RegioniumContext.currentRegion()
             : null;
         if (owner != current) {
-            if (!owner.execute(() -> regionium$recordLightUpdate(layer, pos, chunkKey, owner))) {
-                return;
-            }
+            Regionium.scheduler().executeWhenOwned(
+                level,
+                pos.origin(),
+                () -> regionium$recordLightUpdate(layer, pos, chunkKey, owner)
+            );
             ci.cancel();
             return;
         }
@@ -126,6 +142,7 @@ public abstract class ServerChunkCacheRegioniumMixin {
         ci.cancel();
     }
 
+@org.spongepowered.asm.mixin.Unique
     private void regionium$recordLightUpdate(
         net.minecraft.world.level.LightLayer layer,
         SectionPos pos,
@@ -137,7 +154,11 @@ public abstract class ServerChunkCacheRegioniumMixin {
             return;
         }
         if (owner != expectedOwner) {
-            owner.execute(() -> regionium$recordLightUpdate(layer, pos, chunkKey, owner));
+            Regionium.scheduler().executeWhenOwned(
+                level,
+                pos.origin(),
+                () -> regionium$recordLightUpdate(layer, pos, chunkKey, owner)
+            );
             return;
         }
 
@@ -168,9 +189,15 @@ public abstract class ServerChunkCacheRegioniumMixin {
             ? RegioniumContext.currentRegion()
             : null;
         if (owner != current) {
-            if (!owner.execute(() -> regionium$queueChunkHolder(holder, chunkKey, owner))) {
-                return;
-            }
+            Regionium.scheduler().executeWhenOwned(
+                level,
+                new net.minecraft.core.BlockPos(
+                    holder.getPos().getMinBlockX(),
+                    level.getMinY(),
+                    holder.getPos().getMinBlockZ()
+                ),
+                () -> regionium$queueChunkHolder(holder, chunkKey, owner)
+            );
             ci.cancel();
             return;
         }
@@ -179,6 +206,7 @@ public abstract class ServerChunkCacheRegioniumMixin {
         ci.cancel();
     }
 
+@org.spongepowered.asm.mixin.Unique
     private void regionium$queueChunkHolder(
         ChunkHolder holder,
         long chunkKey,
@@ -189,7 +217,15 @@ public abstract class ServerChunkCacheRegioniumMixin {
             return;
         }
         if (owner != expectedOwner) {
-            owner.execute(() -> regionium$queueChunkHolder(holder, chunkKey, owner));
+            Regionium.scheduler().executeWhenOwned(
+                level,
+                new net.minecraft.core.BlockPos(
+                    holder.getPos().getMinBlockX(),
+                    level.getMinY(),
+                    holder.getPos().getMinBlockZ()
+                ),
+                () -> regionium$queueChunkHolder(holder, chunkKey, owner)
+            );
             return;
         }
         Regionium.scheduler().worldData(level).chunkHoldersToBroadcast(owner).add(holder);
@@ -222,7 +258,11 @@ public abstract class ServerChunkCacheRegioniumMixin {
                 net.minecraft.world.level.gamerules.GameRules.RANDOM_TICK_SPEED
             );
 
-            for (var chunk : List.copyOf(current.worldData().tickingChunks())) {
+            // Vanilla/Folia's tickChunks pass iterates entity-ticking chunks.
+            // Block-ticking chunks are a wider status used for block entity
+            // and scheduled block work; using them here performs random chunk
+            // ticks outside the vanilla entity-ticking range.
+            for (var chunk : List.copyOf(current.worldData().entityTickingChunks())) {
                 long packed = chunk.getPos().pack();
                 if (Regionium.scheduler().regionizer().owner(level, packed) != current) {
                     continue;

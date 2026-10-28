@@ -1,7 +1,6 @@
 package dev.pandor.regionium.core;
 
-import dev.pandor.regionium.mixins.EntityRegioniumPortalInvokerMixin;
-import dev.pandor.regionium.mixins.PortalRegioniumInvokerMixin;
+import dev.pandor.regionium.access.EntityRegioniumPortalAccess;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -17,8 +16,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Bridges the newly-added Portal.portalAsync method and Entity's region-threaded
- * transfer pipeline without making either Minecraft type depend on mixin classes.
+ * Coordinates region-owned portal transfers without making Minecraft types depend on Regionium internals.
  */
 public final class RegioniumPortalDispatcher {
     private static final Set<Entity> PENDING_TRANSFERS = ConcurrentHashMap.newKeySet();
@@ -38,44 +36,37 @@ public final class RegioniumPortalDispatcher {
         return PENDING_TRANSFERS.contains(entity);
     }
 
-    public static boolean invokePortalAsync(
-        ServerLevel sourceWorld, Entity portalTarget, Portal portal, BlockPos portalPos
-    ) {
-        return ((PortalRegioniumInvokerMixin) (Object) portal)
-            .regionium$invokePortalAsync(sourceWorld, portalTarget, portalPos);
-    }
-
     public static boolean startPortalTransferForPortal(
         Portal portal, ServerLevel sourceWorld, Entity portalTarget, BlockPos portalPos
     ) {
         BlockState portalState = sourceWorld.getBlockState(portalPos);
-        EntityRegioniumPortalInvokerMixin entityPortal =
-            (EntityRegioniumPortalInvokerMixin) (Object) portalTarget;
+        EntityRegioniumPortalAccess entityPortal =
+            (EntityRegioniumPortalAccess) (Object) portalTarget;
 
         if (portal instanceof NetherPortalBlock) {
             ServerLevel destination = sourceWorld.getServer().getLevel(
                 sourceWorld.dimension() == Level.NETHER ? Level.OVERWORLD : Level.NETHER
             );
-            return destination != null && entityPortal.regionium$invokeStartPortalTransfer(
+            return destination != null && entityPortal.regionium$startPortalTransfer(
                 portalTarget, sourceWorld, destination, portal, portalPos, portalState
             );
         }
 
         if (portal instanceof EndPortalBlock) {
             if (sourceWorld.dimension() == Level.END && portalTarget instanceof ServerPlayer player) {
-                entityPortal.regionium$invokeExitEndCredits(player);
+                entityPortal.regionium$exitEndCredits(player);
                 return true;
             }
             ServerLevel destination = sourceWorld.getServer().getLevel(
                 sourceWorld.dimension() == Level.END ? Level.OVERWORLD : Level.END
             );
-            return destination != null && entityPortal.regionium$invokeStartPortalTransfer(
+            return destination != null && entityPortal.regionium$startPortalTransfer(
                 portalTarget, sourceWorld, destination, portal, portalPos, portalState
             );
         }
 
         if (portal instanceof EndGatewayBlock) {
-            return entityPortal.regionium$invokeStartPortalTransfer(
+            return entityPortal.regionium$startPortalTransfer(
                 portalTarget, sourceWorld, sourceWorld, portal, portalPos, portalState
             );
         }

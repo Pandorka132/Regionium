@@ -1,7 +1,9 @@
 package dev.pandor.regionium.mixins;
 
+import dev.pandor.regionium.access.ServerCommonPacketListenerRegioniumAccess;
 import dev.pandor.regionium.core.RegioniumChunkSendBatch;
 import io.netty.channel.ChannelFutureListener;
+import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.server.network.ServerCommonPacketListenerImpl;
 import org.jetbrains.annotations.Nullable;
@@ -9,9 +11,15 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.gen.Accessor;
 
 @Mixin(ServerCommonPacketListenerImpl.class)
-public abstract class ServerCommonPacketListenerRegioniumMixin {
+public abstract class ServerCommonPacketListenerRegioniumMixin
+    implements ServerCommonPacketListenerRegioniumAccess {
+
+    @Override
+    @Accessor("connection")
+    public abstract Connection regionium$getConnection();
     @Inject(
         method = "send(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;)V",
         at = @At("HEAD"),

@@ -20,7 +20,7 @@ import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 @Mixin(targets = "net.minecraft.server.level.ServerLevel$EntityCallbacks")
 public abstract class ServerLevelEntityCallbacksRegioniumMixin {
     @WrapOperation(
-        method = "onTickingStart",
+        method = "onTickingStart(Lnet/minecraft/world/entity/Entity;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/entity/EntityTickList;add(Lnet/minecraft/world/entity/Entity;)V"
@@ -37,7 +37,7 @@ public abstract class ServerLevelEntityCallbacksRegioniumMixin {
     }
 
     @WrapOperation(
-        method = "onTickingEnd",
+        method = "onTickingEnd(Lnet/minecraft/world/entity/Entity;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/entity/EntityTickList;remove(Lnet/minecraft/world/entity/Entity;)V"
@@ -54,7 +54,7 @@ public abstract class ServerLevelEntityCallbacksRegioniumMixin {
     }
 
     @WrapOperation(
-        method = "onTrackingStart",
+        method = "onTrackingStart(Lnet/minecraft/world/entity/Entity;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/server/level/ServerChunkCache;addEntity(Lnet/minecraft/world/entity/Entity;)V"
@@ -73,7 +73,7 @@ public abstract class ServerLevelEntityCallbacksRegioniumMixin {
     }
 
     @WrapOperation(
-        method = "onTrackingEnd",
+        method = "onTrackingEnd(Lnet/minecraft/world/entity/Entity;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/server/level/ServerChunkCache;removeEntity(Lnet/minecraft/world/entity/Entity;)V"

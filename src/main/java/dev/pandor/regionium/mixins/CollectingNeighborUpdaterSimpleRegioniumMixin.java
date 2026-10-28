@@ -22,18 +22,11 @@ abstract class CollectingNeighborUpdaterSimpleRegioniumMixin {
         at = @At(value = "INVOKE", target = "Lnet/minecraft/world/level/Level;getBlockState(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;")
     )
     private BlockState regionium$readOnlyOwnedLoadedNeighbor(Level level, BlockPos pos) {
-        if (level instanceof ServerLevel serverLevel) {
-            var current = RegioniumContext.currentRegion();
-            long chunkKey = ChunkPos.pack(pos);
-            if (current != null
-                && (!Regionium.scheduler().isCurrentRegionFor(serverLevel, pos)
-                    || (!current.worldData().hasChunk(chunkKey)
-                        && !Regionium.scheduler().regionizer().hasLoadedFullChunk(serverLevel, chunkKey)))) {
-        
-                return null;
-            }
+        BlockState state = RegioniumContext.getBlockStateIfOwnedAndLoaded(level, pos, 25);
+        if (pos.getX() >= 17650 && pos.getX() <= 17680) {
+            Regionium.LOGGER.info("[PACKET-REDSTONE-DIAG] simple read pos={} state={} current={}", pos, state, RegioniumContext.currentRegion());
         }
-        return level.getBlockState(pos);
+        return state;
     }
 
     @Redirect(

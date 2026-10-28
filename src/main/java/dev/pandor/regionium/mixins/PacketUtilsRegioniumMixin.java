@@ -67,6 +67,7 @@ public abstract class PacketUtilsRegioniumMixin {
         regionium$route(packet, listener, ci);
     }
 
+@org.spongepowered.asm.mixin.Unique
     private static <T extends PacketListener> void regionium$route(
         Packet<T> packet, T listener, CallbackInfo ci
     ) {

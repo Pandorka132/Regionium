@@ -11,7 +11,9 @@ import org.spongepowered.asm.mixin.Mixin;
 
 @Mixin(ServerPlayer.class)
 public abstract class ServerPlayerRegioniumPacketMixin implements ServerPlayerRegioniumPacketAccess {
+@org.spongepowered.asm.mixin.Unique
     private final PacketProcessor regionium$packetProcessor = new PacketProcessor(null);
+@org.spongepowered.asm.mixin.Unique
     private volatile RegioniumWorldData regionium$lastRegion;
 
     @Override

@@ -2,11 +2,14 @@ package dev.pandor.regionium.mixins;
 
 import dev.pandor.regionium.Regionium;
 import dev.pandor.regionium.core.RegioniumContext;
+import dev.pandor.regionium.core.RegioniumPortalDispatcher;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.entity.EntityTickList;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.Redirect;
 
 import java.util.function.Consumer;
@@ -16,6 +19,36 @@ import java.util.function.Consumer;
  */
 @Mixin(ServerLevel.class)
 public abstract class ServerLevelEntityTickRegioniumMixin {
+    @Inject(
+        method = "tickNonPassenger",
+        at = @At(value = "INVOKE", target = "Lnet/minecraft/world/entity/Entity;tick()V", shift = At.Shift.AFTER),
+        cancellable = true
+    )
+    private void regionium$handlePortalAfterEntityTick(Entity entity, CallbackInfo ci) {
+        if (entity instanceof net.minecraft.server.level.ServerPlayer || entity.isRemoved()) {
+            return;
+        }
+        ((EntityRegioniumPortalInvokerMixin) (Object) entity).regionium$invokeHandlePortal();
+        if (RegioniumPortalDispatcher.isTransferPending(entity)) {
+            ci.cancel();
+        }
+    }
+
+    @Inject(
+        method = "tickPassenger",
+        at = @At(value = "INVOKE", target = "Lnet/minecraft/world/entity/Entity;rideTick()V", shift = At.Shift.AFTER),
+        cancellable = true
+    )
+    private void regionium$handlePortalAfterPassengerTick(Entity vehicle, Entity entity, CallbackInfo ci) {
+        if (entity instanceof net.minecraft.server.level.ServerPlayer || entity.isRemoved()) {
+            return;
+        }
+        ((EntityRegioniumPortalInvokerMixin) (Object) entity).regionium$invokeHandlePortal();
+        if (RegioniumPortalDispatcher.isTransferPending(entity)) {
+            ci.cancel();
+        }
+    }
+
     @Redirect(
         method = "tick",
         at = @At(
@@ -57,15 +90,9 @@ public abstract class ServerLevelEntityTickRegioniumMixin {
             // belonging to the region, even when its ChunkHolder had not
             // reached ENTITY_TICKING/FULL yet.
             long entityChunkKey = entity.chunkPosition().pack();
-            // ChunkHolder futures describe the loading/status pipeline. The
-            // DistanceManager's simulation tracker is the authoritative gate
-            // for whether this entity is eligible to tick at the current
-            // simulation distance.
-            if (!level.getChunkSource().chunkMap.getDistanceManager()
-                .inEntityTickingRange(entityChunkKey)) {
-                continue;
-            }
-
+            // The holder's entity-ticking future is the published status for
+            // this chunk. Do not query DistanceManager from a region worker:
+            // its SimulationChunkTracker maps are mutable server-thread state.
             var holder = ((dev.pandor.regionium.mixins.ChunkMapRegioniumVisibleAccessorMixin)
                 (Object) level.getChunkSource().chunkMap)
                 .regionium$getVisibleChunkMap()
@@ -77,15 +104,14 @@ public abstract class ServerLevelEntityTickRegioniumMixin {
                 continue;
             }
 
-            if (entity instanceof net.minecraft.server.level.ServerPlayer player) {
-                // A disconnect can clear the connection before the entity is
-                // removed from the region-owned entity set. Vanilla
-                // ServerPlayer.tick assumes a live connection, so lifecycle
-                // ownership must exclude the player for that tick.
-                if (player.connection == null
-                    || !Regionium.scheduler().arePlayerPhysicsChunksReady(level, player)) {
-                    continue;
-                }
+            if (entity instanceof net.minecraft.server.level.ServerPlayer) {
+                // ServerPlayer is ticked by ServerGamePacketListenerImpl.tick(),
+                // which runs as part of the owning Connection.tick() after the
+                // world tick.
+                // Folia keeps players in RegionizedWorldData.localPlayers rather
+                // than the region entity-tick collection; ticking them here as
+                // well would execute player.doTick() twice per server tick.
+                continue;
             }
 
             vanillaTick.accept(entity);

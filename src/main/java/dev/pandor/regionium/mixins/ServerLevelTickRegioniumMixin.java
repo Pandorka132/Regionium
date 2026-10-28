@@ -8,8 +8,11 @@ import dev.pandor.regionium.core.RegioniumContext;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.raid.Raids;
 import net.minecraft.world.level.border.WorldBorder;
+import net.minecraft.server.players.SleepStatus;
 import net.minecraft.world.level.levelgen.RandomState;
-import net.minecraft.util.debug.LevelDebugSynchronizers;
+import net.minecraft.world.level.dimension.end.EnderDragonFight;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.attribute.EnvironmentAttributeSystem;
 import net.minecraft.world.ticks.LevelTicks;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -17,27 +20,27 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 import java.util.function.BiConsumer;
 
 @Mixin(ServerLevel.class)
 public abstract class ServerLevelTickRegioniumMixin {
+@org.spongepowered.asm.mixin.Unique
     private static final ThreadLocal<Boolean> REGIONIUM$DIRECT_TICKS = ThreadLocal.withInitial(() -> false);
 
     /*
      * ServerLevel.tick() is intentionally allowed to execute on the global
      * server thread as well as region threads.
      *
-     * Global execution owns world-wide maintenance (weather, border, raids,
-     * entity-section persistence, debug/global bookkeeping). Region
-     * execution owns simulation work. The wrappers below make the distinction
+     * Global execution owns world-wide maintenance (weather, border, raid
+     * bookkeeping, entity-section persistence, and cache maintenance).
+     * Region execution owns simulation and debug synchronization work. The wrappers make the distinction
      * explicit so global maintenance runs exactly once rather than once per
      * region.
      */
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/border/WorldBorder;tick()V"
@@ -53,7 +56,7 @@ public abstract class ServerLevelTickRegioniumMixin {
     }
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/server/level/ServerLevel;advanceWeatherCycle()V"
@@ -69,23 +72,25 @@ public abstract class ServerLevelTickRegioniumMixin {
     }
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
-            target = "Lnet/minecraft/server/level/ServerLevel;wakeUpAllPlayers()V"
+            target = "Lnet/minecraft/server/players/SleepStatus;areEnoughSleeping(I)Z",
+            ordinal = 0
         )
     )
-    private void regionium$globalWakePlayers(
-        ServerLevel self,
-        Operation<Void> original
+    private boolean regionium$skipRegionSleepHandling(
+        SleepStatus sleepStatus,
+        int sleepPercentage,
+        Operation<Boolean> original
     ) {
-        if (!RegioniumContext.isRegionThread()) {
-            original.call(self);
-        }
+        return RegioniumContext.isRegionThread()
+            ? false
+            : original.call(sleepStatus, sleepPercentage);
     }
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/server/level/ServerLevel;updateSkyBrightness()V"
@@ -100,6 +105,22 @@ public abstract class ServerLevelTickRegioniumMixin {
         }
     }
 
+    @WrapOperation(
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/world/attribute/EnvironmentAttributeSystem;invalidateTickCache()V"
+        )
+    )
+    private void regionium$globalEnvironmentAttributeCache(
+        EnvironmentAttributeSystem attributes,
+        Operation<Void> original
+    ) {
+        if (!RegioniumContext.isRegionThread()) {
+            original.call(attributes);
+        }
+    }
+
     @Inject(method = "tickTime", at = @At("HEAD"), cancellable = true)
     private void regionium$regionTickTime(CallbackInfo ci) {
         if (!RegioniumContext.isRegionThread()) {
@@ -110,14 +131,14 @@ public abstract class ServerLevelTickRegioniumMixin {
         // advances its own redstone clock independently, matching Folia's
         // RegionizedWorldData.getRedstoneGameTime().
         ServerLevel level = (ServerLevel) (Object) this;
-        if (((ServerLevelRegioniumTimeAccessor) (Object) level).regionium$isTickTime()) {
+        if (((ServerLevelRegioniumAccessorMixin) (Object) level).regionium$isTickTime()) {
             RegioniumContext.requireRegionThread().worldData().advanceRedstoneTime();
         }
         ci.cancel();
     }
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/entity/raid/Raids;tick(Lnet/minecraft/server/level/ServerLevel;)V"
@@ -128,29 +149,39 @@ public abstract class ServerLevelTickRegioniumMixin {
         ServerLevel self,
         Operation<Void> original
     ) {
-        if (!RegioniumContext.isRegionThread()) {
-            original.call(raids, self);
-        }
+        // Raids.tick dispatches global counter maintenance or region-owned
+        // raid simulation according to the current execution context.
+        original.call(raids, self);
     }
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/dimension/end/EnderDragonFight;tick()V"
         )
     )
     private void regionium$globalDragonFight(
-        net.minecraft.world.level.dimension.end.EnderDragonFight fight,
+        EnderDragonFight fight,
         Operation<Void> original
     ) {
-        if (!RegioniumContext.isRegionThread()) {
-            original.call(fight);
+        if (RegioniumContext.isRegionThread()) {
+            ServerLevel level = (ServerLevel) (Object) this;
+            BlockPos origin = ((EnderDragonFightRegioniumAccessorMixin) (Object) fight)
+                .regionium$getOrigin();
+            var owner = Regionium.scheduler().regionizer().owner(
+                level,
+                origin.getX() >> 4,
+                origin.getZ() >> 4
+            );
+            if (owner == RegioniumContext.currentRegion()) {
+                original.call(fight);
+            }
         }
     }
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/entity/PersistentEntitySectionManager;tick()V"
@@ -166,7 +197,7 @@ public abstract class ServerLevelTickRegioniumMixin {
     }
 
     @WrapOperation(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/levelgen/RandomState;garbageCollect()V"
@@ -181,30 +212,13 @@ public abstract class ServerLevelTickRegioniumMixin {
         }
     }
 
-    @WrapOperation(
-        method = "tick",
-        at = @At(
-            value = "INVOKE",
-            target = "Lnet/minecraft/util/debug/LevelDebugSynchronizers;tick(Lnet/minecraft/util/debug/ServerDebugSubscribers;)V"
-        )
-    )
-    private void regionium$globalDebugSynchronizers(
-        LevelDebugSynchronizers synchronizers,
-        net.minecraft.util.debug.ServerDebugSubscribers subscribers,
-        Operation<Void> original
-    ) {
-        if (!RegioniumContext.isRegionThread()) {
-            original.call(synchronizers, subscribers);
-        }
-    }
-
     /**
      * Folia architecture: ServerLevel exposes the region-owned LevelTicks
      * directly. Vanilla scheduling code therefore needs no special-case
      * routing: every scheduleTick() call made by a region task naturally lands
      * in that region's queue.
      */
-    @Inject(method = "getBlockTicks", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "getBlockTicks()Lnet/minecraft/world/ticks/LevelTicks;", at = @At("HEAD"), cancellable = true)
     private void regionium$getRegionBlockTicks(CallbackInfoReturnable<LevelTicks<net.minecraft.world.level.block.Block>> cir) {
         if (!RegioniumContext.isRegionThread()) return;
         var region = RegioniumContext.currentRegion();
@@ -214,7 +228,7 @@ public abstract class ServerLevelTickRegioniumMixin {
         }
     }
 
-    @Inject(method = "getFluidTicks", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "getFluidTicks()Lnet/minecraft/world/ticks/LevelTicks;", at = @At("HEAD"), cancellable = true)
     private void regionium$getRegionFluidTicks(CallbackInfoReturnable<LevelTicks<net.minecraft.world.level.material.Fluid>> cir) {
         if (!RegioniumContext.isRegionThread()) return;
         var region = RegioniumContext.currentRegion();
@@ -225,7 +239,7 @@ public abstract class ServerLevelTickRegioniumMixin {
     }
 
     @Redirect(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/ticks/LevelTicks;tick(JILjava/util/function/BiConsumer;)V",
@@ -252,7 +266,7 @@ public abstract class ServerLevelTickRegioniumMixin {
     }
 
     @Redirect(
-        method = "tick",
+        method = "tick(Ljava/util/function/BooleanSupplier;)V",
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/ticks/LevelTicks;tick(JILjava/util/function/BiConsumer;)V",

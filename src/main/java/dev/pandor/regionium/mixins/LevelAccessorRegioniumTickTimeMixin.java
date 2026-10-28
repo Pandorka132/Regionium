@@ -58,6 +58,7 @@ public interface LevelAccessorRegioniumTickTimeMixin {
         }
     }
 
+@org.spongepowered.asm.mixin.Unique
     private RegioniumRegion regionium$clockOwner(BlockPos pos) {
         if (!((Object) this instanceof ServerLevel level)) {
             return null;

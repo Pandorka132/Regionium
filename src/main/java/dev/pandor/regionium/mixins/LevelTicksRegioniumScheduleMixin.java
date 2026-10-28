@@ -14,6 +14,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /** Routes worker-generated scheduled ticks into the current Folia-style region. */
 @Mixin(LevelTicks.class)
 public abstract class LevelTicksRegioniumScheduleMixin<T> {
+@org.spongepowered.asm.mixin.Unique
     private static final ThreadLocal<Boolean> REGIONIUM$ROUTING = ThreadLocal.withInitial(() -> false);
 
     @Inject(method = "schedule", at = @At("HEAD"), cancellable = true)
