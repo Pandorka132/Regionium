@@ -1273,12 +1273,6 @@ public final class RegioniumScheduler implements AutoCloseable {
     }
 
     /**
-     * Requests a square of chunks asynchronously without blocking a region
-     * worker. Returned chunk references must only be used for scheduling and
-     * status checks; world-state reads and mutations still belong on the
-     * region owning each chunk.
-     */
-    /**
      * Keeps explicit, non-expiring chunk tickets alive for the entire asynchronous
      * operation. Vanilla getChunkFuture() uses short-lived UNKNOWN tickets which
      * can expire before an asynchronous future completes; portal searches must

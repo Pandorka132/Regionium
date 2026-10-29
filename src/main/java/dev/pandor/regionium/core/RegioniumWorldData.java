@@ -236,11 +236,9 @@ public final class RegioniumWorldData {
         if (offset == 0L) {
             return;
         }
-        @SuppressWarnings("unchecked")
         LevelChunkTicks<Block> block = (LevelChunkTicks<Block>)
             ((dev.pandor.regionium.mixins.LevelChunkRegioniumTickAccessorMixin) chunk)
                 .regionium$getBlockTicks();
-        @SuppressWarnings("unchecked")
         LevelChunkTicks<Fluid> fluid = (LevelChunkTicks<Fluid>)
             ((dev.pandor.regionium.mixins.LevelChunkRegioniumTickAccessorMixin) chunk)
                 .regionium$getFluidTicks();
@@ -422,10 +420,8 @@ public final class RegioniumWorldData {
 
         try {
             var access = (dev.pandor.regionium.mixins.LevelChunkRegioniumTickAccessorMixin) chunk;
-            @SuppressWarnings("unchecked")
             LevelChunkTicks<Block> block =
                 (LevelChunkTicks<Block>) access.regionium$getBlockTicks();
-            @SuppressWarnings("unchecked")
             LevelChunkTicks<Fluid> fluid =
                 (LevelChunkTicks<Fluid>) access.regionium$getFluidTicks();
 

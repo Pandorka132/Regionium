@@ -6,8 +6,8 @@ import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectCollection;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
-import it.unimi.dsi.fastutil.objects.ObjectSet;
 import net.minecraft.world.entity.raid.Raid;
+import org.jspecify.annotations.NonNull;
 
 /**
  * Thread-safe fastutil-compatible raid table. Views are detached snapshots,
@@ -53,7 +53,7 @@ public final class ConcurrentRaidMap extends Int2ObjectOpenHashMap<Raid> {
     }
 
     @Override
-    public synchronized ObjectCollection<Raid> values() {
+    public synchronized @NonNull ObjectCollection<Raid> values() {
         ObjectArrayList<Raid> snapshot = new ObjectArrayList<>(super.size());
         snapshot.addAll(super.values());
         return snapshot;

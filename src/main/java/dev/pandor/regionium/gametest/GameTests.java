@@ -486,7 +486,7 @@ public final class GameTests {
                 .setValue(BlockStateProperties.FACING, Direction.UP));
             helper.setBlock(slime, Blocks.SLIME_BLOCK);
             helper.setBlock(redstone, Blocks.REDSTONE_BLOCK);
-            // Match the repro exactly: the final neighbour update starts it.
+            // Match the repro exactly: the final neighbor update starts it.
             helper.setBlock(update, Blocks.STONE);
         });
 

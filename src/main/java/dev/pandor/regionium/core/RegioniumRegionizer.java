@@ -30,11 +30,11 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Stateful spatial region manager.
- *
+ * <p>
  * This is the Fabric-side equivalent of Folia's ThreadedRegionizer:
  * chunk topology is persistent, regions own RegioniumWorldData, and split/
  * merge/topology changes migrate the complete region-local state.
- *
+ * <p>
  * There is deliberately no second chunk lease or object ownership table.
  */
 public final class RegioniumRegionizer {
@@ -121,7 +121,7 @@ public final class RegioniumRegionizer {
      * SerializableChunkData snapshot. Synchronizing on LevelChunk alone is
      * insufficient: vanilla block/random ticks and block-entity ticks do not
      * all acquire that monitor before mutating the chunk.
-     *
+     * <p>
      * The lock is held only for the in-memory snapshot, never for asynchronous
      * disk I/O. ChunkMap.save() invokes copyOf() synchronously before it queues
      * the serialized data for background writing.
@@ -954,7 +954,7 @@ public final class RegioniumRegionizer {
 
         // Any empty -> occupied transition changes the graph used for region
         // connectivity, even when this section already exists as an empty
-        // neighbour halo. In particular, it can bridge two existing regions.
+        // neighbor halo. In particular, it can bridge two existing regions.
         boolean topologyChanged = true;
         for (int dz = -EMPTY_SECTION_CREATE_RADIUS; dz <= EMPTY_SECTION_CREATE_RADIUS; ++dz) {
             for (int dx = -EMPTY_SECTION_CREATE_RADIUS; dx <= EMPTY_SECTION_CREATE_RADIUS; ++dx) {
@@ -970,7 +970,6 @@ public final class RegioniumRegionizer {
                 } else {
                     boolean wasDead = neighbour.isDead();
                     neighbour.nonEmptyNeighbours++;
-                    topologyChanged |= wasDead;
                 }
             }
         }
